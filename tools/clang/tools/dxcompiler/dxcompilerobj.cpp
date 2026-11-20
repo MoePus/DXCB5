@@ -74,6 +74,20 @@
 #include "metal_irconverter.h"
 #endif
 
+#ifdef ENABLE_DXCB5
+#include "dxc/HLSL/DxilGenerationPass.h"
+#include "dxcb5/CompileSession.h"
+#include "dxcb5/Compiler.h"
+#include "dxcb5/DxbcWriter.h"
+#include "dxcb5/LoopRegionValues.h"
+#include "clang/Frontend/Utils.h"
+#include "clang/Lex/PPCallbacks.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/ValueHandle.h"
+#include "llvm/Pass.h"
+#include <mutex>
+#endif
+
 #define CP_UTF16 1200
 
 using namespace llvm;
@@ -455,6 +469,250 @@ static HRESULT ErrorWithString(const std::string &error, REFIID riid,
   return S_OK;
 }
 
+#ifdef ENABLE_DXCB5
+static HRESULT ReadDxcb5VertexOutput(const options::DxcOpts &opts,
+                                     IDxcIncludeHandler *handler,
+                                     CComPtr<IDxcBlob> &blob,
+                                     std::vector<dxcb5::SignatureElement> &output,
+                                     StringRef &signaturePart,
+                                     raw_ostream &diagnostics) {
+  TimeTraceScope scope("DXCB5 VS Signature", StringRef());
+  options::StringRefWide path(opts.Dxcb5VertexBytecode);
+  HRESULT status;
+  if (handler) {
+    status = handler->LoadSource(path, &blob);
+  } else {
+    CComPtr<IDxcBlobEncoding> encodingBlob;
+    status = DxcCreateBlobFromFile(path, nullptr, &encodingBlob);
+    blob = encodingBlob.p;
+  }
+  if (FAILED(status) || !blob || !blob->GetBufferSize()) {
+    diagnostics << "error: could not read --vs-dxbc file '"
+                << opts.Dxcb5VertexBytecode << "' or file is empty\n";
+    return FAILED(status) ? status : E_INVALIDARG;
+  }
+  StringRef bytecode(static_cast<const char *>(blob->GetBufferPointer()),
+                    blob->GetBufferSize());
+  std::string error;
+  if (!dxcb5::ReadVertexOutputSignature(bytecode, output, error, &signaturePart)) {
+    diagnostics << "error: " << error << '\n';
+    return E_INVALIDARG;
+  }
+  return S_OK;
+}
+
+class Dxcb5CachePreprocess : public PreprocessorFrontendAction {
+  class VolatileMacros : public PPCallbacks {
+    bool &Stable;
+  public:
+    explicit VolatileMacros(bool &stable) : Stable(stable) {}
+    void MacroExpands(const Token &token, const MacroDefinition &, SourceRange,
+                      const MacroArgs *) override {
+      StringRef name = token.getIdentifierInfo()->getName();
+      if (name == "__TIME__" || name == "__DATE__" || name == "__TIMESTAMP__")
+        Stable = false;
+    }
+  };
+
+  raw_ostream &Output;
+public:
+  bool Stable = true;
+  explicit Dxcb5CachePreprocess(raw_ostream &output) : Output(output) {}
+
+  void ExecuteAction() override {
+    auto &compiler = getCompilerInstance();
+    auto &preprocessor = compiler.getPreprocessor();
+    preprocessor.addPPCallbacks(llvm::make_unique<VolatileMacros>(Stable));
+    compiler.getPreprocessorOutputOpts().ShowCPP = 1;
+    compiler.getPreprocessorOutputOpts().ShowLineMarkers = 0;
+    // Keep the stage's token spellings and pragmas while ignoring inactive
+    // source line gaps. In particular, never rewrite literal token contents.
+    DoPrintPreprocessedInput(preprocessor, &Output,
+                             compiler.getPreprocessorOutputOpts(),
+                             /*CompactLineGaps=*/true);
+  }
+};
+
+static bool BuildDxcb5FrontendKey(CompilerInstance &compiler, StringRef source,
+                                  const options::DxcOpts &opts,
+                                  dxcb5::FrontendKey &key) {
+  TimeTraceScope scope("DXCB5 Cache Preprocess", StringRef());
+  // Share the per-request filesystem: a miss rereads the same include blobs.
+  CompilerInstance preprocessor;
+  preprocessor.setInvocation(new CompilerInvocation(compiler.getInvocation()));
+  preprocessor.createDiagnostics(new DiagnosticConsumer());
+  preprocessor.setTarget(&compiler.getTarget());
+  raw_string_ostream text(key.Preprocessed);
+  Dxcb5CachePreprocess action(text);
+  if (!action.BeginSourceFile(preprocessor, FrontendInputFile(source, IK_HLSL)))
+    return false;
+  action.Execute();
+  action.EndSourceFile();
+  if (!action.Stable || preprocessor.getDiagnostics().hasErrorOccurred() ||
+      preprocessor.getDiagnostics().getClient()->getNumWarnings())
+    return false;
+  text.flush();
+
+  key.SourceName = source.str();
+  key.EntryPoint = compiler.getCodeGenOpts().HLSLEntryFunction;
+  key.Profile = opts.TargetProfile.str();
+  for (const auto *arg : opts.Args) {
+    auto id = arg->getOption().getID();
+    switch (id) {
+    case options::OPT_INPUT:
+    case options::OPT_target_profile:
+    case options::OPT_entrypoint:
+    case options::OPT_dxcb5_vs_dxbc:
+    case options::OPT_Fo:
+    case options::OPT_Fe:
+    case options::OPT_ftime_report:
+    case options::OPT_ftime_trace:
+    case options::OPT_ftime_trace_EQ:
+    case options::OPT_ftime_trace_granularity_EQ:
+      continue;
+    }
+    key.Arguments.push_back(std::to_string(id));
+    for (const char *value : arg->getValues())
+      key.Arguments.emplace_back(value);
+  }
+  return true;
+}
+
+static void ExpandDxcb5Trig(llvm::Module &module);
+
+static std::unique_ptr<llvm::Module>
+BuildDxcb5Module(CompilerInstance &compiler, LLVMContext &context,
+                 StringRef sourceName, raw_ostream &diagnostics) {
+  TimeTraceScope scope("DXCB5 Frontend", StringRef());
+  EmitLLVMOnlyAction action(&context);
+  if (!action.BeginSourceFile(compiler, FrontendInputFile(sourceName, IK_HLSL)))
+    return nullptr;
+  action.Execute();
+  action.EndSourceFile();
+  if (compiler.getDiagnostics().hasErrorOccurred())
+    return nullptr;
+
+  auto module = action.takeModule();
+  if (!module) {
+    diagnostics << "error: DXCB5 frontend did not produce an LLVM module\n";
+    return nullptr;
+  }
+  ExpandDxcb5Trig(*module);
+  if (compiler.getCodeGenOpts().OptimizationLevel) {
+    auto &dxil = module->GetDxilModule();
+    auto &entry = *const_cast<Function *>(dxil.GetEntryFunction());
+    dxcb5::ReuseLoopRegionValues(entry, dxil);
+  }
+  return module;
+}
+
+static HRESULT RunDxcb5Backend(llvm::Module &module,
+                              ArrayRef<dxcb5::SignatureElement> vertexOutput,
+                              bool nanSafe, raw_ostream &output,
+                              raw_ostream &diagnostics) {
+  TimeTraceScope scope("DXCB5 SM5 Backend", StringRef());
+  return dxcb5::Compile(module, vertexOutput, output, diagnostics, {}, nanSafe);
+}
+
+static void ExpandDxcb5Trig(llvm::Module &module) {
+  TimeTraceScope scope("DXCB5 Expand Trig", StringRef());
+  std::unique_ptr<FunctionPass> expand(createDxilExpandTrigIntrinsicsPass());
+  auto &entry = *module.GetDxilModule().GetEntryFunction();
+  expand->runOnFunction(const_cast<Function &>(entry));
+}
+
+static HRESULT RunCachedDxcb5Backend(
+    dxcb5::CompileSession::Frontend &frontend,
+    ArrayRef<dxcb5::SignatureElement> vertexOutput, StringRef signaturePart,
+    bool nanSafe, raw_ostream &output, raw_ostream &diagnostics) {
+  if (auto *cached = frontend.FindBytecode(signaturePart)) {
+    TimeTraceScope scope("DXCB5 Backend Cache Hit", StringRef());
+    output << *cached;
+    return S_OK;
+  }
+  std::string object;
+  raw_string_ostream stream(object);
+  auto status = RunDxcb5Backend(*frontend.Module, vertexOutput, nanSafe,
+                                stream, diagnostics);
+  if (SUCCEEDED(status)) {
+    stream.flush();
+    output << object;
+    frontend.SaveBytecode(signaturePart, object);
+  }
+  return status;
+}
+
+static HRESULT CompileDxcb5(CompilerInstance &compiler, LLVMContext &context,
+                            StringRef sourceName, const options::DxcOpts &opts,
+                            IDxcIncludeHandler *includeHandler,
+                            dxcb5::CompileSession *session,
+                            raw_ostream &output, raw_ostream &diagnostics) {
+  TimeTraceScope scope("DXCB5 Compile", StringRef());
+  CComPtr<IDxcBlob> vertexBlob;
+  std::vector<dxcb5::SignatureElement> vertexOutput;
+  StringRef signaturePart;
+  if (!opts.Dxcb5VertexBytecode.empty()) {
+    auto status = ReadDxcb5VertexOutput(opts, includeHandler, vertexBlob,
+                                        vertexOutput, signaturePart, diagnostics);
+    if (FAILED(status))
+      return status;
+  }
+
+  const bool nanSafe =
+      opts.Dxcb5NanSafe || opts.DisableOptimizations || opts.IEEEStrict;
+  dxcb5::CompileSession::Frontend frontend;
+  if (!session || !BuildDxcb5FrontendKey(compiler, sourceName, opts, frontend.Key)) {
+    auto module = BuildDxcb5Module(compiler, context, sourceName, diagnostics);
+    if (!module)
+      return E_FAIL;
+    return RunDxcb5Backend(*module, vertexOutput, nanSafe, output, diagnostics);
+  }
+
+  auto *entry = session->FindFrontend(frontend.Key);
+  if (entry) {
+    TimeTraceScope hit("DXCB5 Frontend Cache Hit", StringRef());
+  } else {
+    frontend.Context = llvm::make_unique<LLVMContext>();
+    frontend.Module = BuildDxcb5Module(compiler, *frontend.Context, sourceName,
+                                       diagnostics);
+    if (!frontend.Module)
+      return E_FAIL;
+    // Keep diagnostic locations tied to the source that produced them.
+    if (compiler.getDiagnostics().getClient()->getNumWarnings())
+      return RunDxcb5Backend(*frontend.Module, vertexOutput, nanSafe, output,
+                             diagnostics);
+    entry = &session->SaveFrontend(std::move(frontend));
+  }
+  return RunCachedDxcb5Backend(*entry, vertexOutput, signaturePart, nanSafe,
+                               output, diagnostics);
+}
+
+class Dxcb5TimeTrace {
+  bool Owns = false;
+public:
+  void Start(const options::DxcOpts &opts) {
+    Owns = opts.Dxcb5 && !opts.TimeTrace.empty() && !timeTraceProfilerEnabled();
+    if (Owns)
+      timeTraceProfilerInitialize(opts.TimeTraceGranularity);
+  }
+
+  HRESULT Save(DxcResult &result) const {
+    if (!Owns)
+      return S_OK;
+    std::string trace;
+    raw_string_ostream stream(trace);
+    timeTraceProfilerWrite(stream);
+    stream.flush();
+    return result.SetOutputString(DXC_OUT_TIME_TRACE, trace.c_str(), trace.size());
+  }
+
+  ~Dxcb5TimeTrace() {
+    if (Owns)
+      timeTraceProfilerCleanup();
+  }
+};
+#endif
+
 class DxcCompiler : public IDxcCompiler3,
                     public IDxcLangExtensions3,
                     public IDxcContainerEvent,
@@ -470,6 +728,10 @@ private:
   DxcLangExtensionsHelper m_langExtensionsHelper;
   CComPtr<IDxcContainerEventsHandler> m_pDxcContainerEventsHandler;
   DxcCompilerAdapter m_DxcCompilerAdapter;
+#ifdef ENABLE_DXCB5
+  std::mutex m_dxcb5SessionMutex;
+  dxcb5::CompileSession m_dxcb5Session;
+#endif
 
 public:
   DxcCompiler(IMalloc *pMalloc)
@@ -570,6 +832,16 @@ public:
         }
       }
 
+#ifndef ENABLE_DXCB5
+      if (opts.Dxcb5)
+        return ErrorWithString("DXCB5 support is unavailable in this build.",
+                               riid, ppResult);
+#endif
+
+#ifdef ENABLE_DXCB5
+      Dxcb5TimeTrace dxcb5Trace;
+      dxcb5Trace.Start(opts);
+#endif
       bool isPreprocessing = !opts.Preprocess.empty();
       if (isPreprocessing) {
         DxcEtw_DXCompilerPreprocess_Start();
@@ -717,6 +989,7 @@ public:
       bool produceFullContainer = false;
       bool needsValidation = false;
       bool validateRootSigContainer = false;
+      HRESULT backendStatus = S_OK;
 
       if (isPreprocessing) {
         TimeTraceScope TimeScope("PreprocessAction", StringRef(""));
@@ -828,8 +1101,8 @@ public:
           compiler.getLangOpts().HLSLEntryFunction =
               compiler.getCodeGenOpts().HLSLEntryFunction = "";
 
-        produceFullContainer = opts.ProduceFullContainer();
-        needsValidation = opts.NeedsValidation();
+        produceFullContainer = !opts.Dxcb5 && opts.ProduceFullContainer();
+        needsValidation = !opts.Dxcb5 && opts.NeedsValidation();
 
         if (compiler.getCodeGenOpts().HLSLProfile == "lib_6_x") {
           // Currently do not support stripping reflection from offline linking
@@ -837,7 +1110,11 @@ public:
           opts.KeepReflectionInDxil = true;
         }
 
-        if (opts.ValVerMajor != UINT_MAX) {
+        if (opts.Dxcb5) {
+          compiler.getCodeGenOpts().HLSLValidatorMajorVer = 0;
+          compiler.getCodeGenOpts().HLSLValidatorMinorVer = 0;
+          compiler.getCodeGenOpts().DXCB5PreserveVectors = true;
+        } else if (opts.ValVerMajor != UINT_MAX) {
           // user-specified validator version override
           compiler.getCodeGenOpts().HLSLValidatorMajorVer = opts.ValVerMajor;
           compiler.getCodeGenOpts().HLSLValidatorMinorVer = opts.ValVerMinor;
@@ -967,6 +1244,23 @@ public:
       }
 #endif
       // SPIRV change ends
+#ifdef ENABLE_DXCB5
+      else if (opts.Dxcb5) {
+        std::unique_lock<std::mutex> lock(m_dxcb5SessionMutex, std::defer_lock);
+        bool cache = opts.Dxcb5Cache && opts.BindingTableDefine.empty() &&
+                     opts.ImportBindingTable.empty() &&
+                     !opts.DebugInfo && !opts.DisplayIncludeProcess &&
+                     m_langExtensionsHelper.GetSemanticDefines().empty() &&
+                     m_langExtensionsHelper.GetIntrinsicTables().empty();
+        if (cache)
+          lock.lock();
+        backendStatus = CompileDxcb5(
+            compiler, llvmContext, pUtf8SourceName, opts, pIncludeHandler,
+            cache ? &m_dxcb5Session : nullptr, outStream, w);
+        outStream.flush();
+        w.flush();
+      }
+#endif
       else if (!isPreprocessing) {
         EmitBCAction action(&llvmContext);
         FrontendInputFile file(pUtf8SourceName, IK_HLSL);
@@ -1303,8 +1597,10 @@ public:
         } // PDB in private
       }   // Write PDB
 
-      IFT(primaryOutput.SetObject(pOutputBlob, opts.DefaultTextCodePage));
-      IFT(pResult->SetOutput(primaryOutput));
+      if (SUCCEEDED(backendStatus)) {
+        IFT(primaryOutput.SetObject(pOutputBlob, opts.DefaultTextCodePage));
+        IFT(pResult->SetOutput(primaryOutput));
+      }
 
       // It is possible for errors to occur, but the diagnostic or AST consumers
       // can recover from them, or translate them to mean something different.
@@ -1313,8 +1609,13 @@ public:
       // DiagnosticClient for the number of errors.
       unsigned NumErrors =
           compiler.getDiagnostics().getClient()->getNumErrors();
-      IFT(pResult->SetStatusAndPrimaryResult(NumErrors > 0 ? E_FAIL : S_OK,
-                                             primaryOutput.kind));
+      HRESULT compileStatus = NumErrors > 0 ? E_FAIL : backendStatus;
+      IFT(pResult->SetStatusAndPrimaryResult(
+          compileStatus, FAILED(backendStatus) ? DXC_OUT_NONE
+                                              : primaryOutput.kind));
+#ifdef ENABLE_DXCB5
+      IFT(dxcb5Trace.Save(*pResult));
+#endif
       IFT(pResult->QueryInterface(riid, ppResult));
 
       hr = S_OK;
@@ -1524,10 +1825,17 @@ public:
 
     compiler.getLangOpts().EnablePayloadAccessQualifiers =
         Opts.EnablePayloadQualifiers;
+    const ShaderModel *SM = ShaderModel::GetByName(Opts.TargetProfile);
+    StringRef internalProfile = Opts.TargetProfile;
+    if (Opts.Dxcb5) {
+      // The shared DXIL passes require an SM6 profile. HLSL macros describe
+      // the DXBC target requested by the caller.
+      compiler.getLangOpts().HLSLProfileForPreprocessor = Opts.TargetProfile;
+      SM = ShaderModel::Get(SM->GetKind(), 6, 0);
+      internalProfile = SM->GetName();
+    }
     compiler.getLangOpts().HLSLProfile = compiler.getCodeGenOpts().HLSLProfile =
-        Opts.TargetProfile;
-    const ShaderModel *SM = hlsl::ShaderModel::GetByName(
-        compiler.getLangOpts().HLSLProfile.c_str());
+        internalProfile;
     if (SM->IsSM69Plus())
       compiler.getLangOpts().MaxHLSLVectorLength = DXIL::kSM69MaxVectorLength;
     else

@@ -341,6 +341,7 @@ void EmitAssemblyHelper::CreatePasses() {
   // HLSL Change - begin
   PMBuilder.HLSLHighLevel = CodeGenOpts.HLSLHighLevel;
   PMBuilder.HLSLAllowPreserveValues = CodeGenOpts.HLSLAllowPreserveValues;
+  PMBuilder.DXCB5PreserveVectors = CodeGenOpts.DXCB5PreserveVectors;
   PMBuilder.HLSLOnlyWarnOnUnrollFail = CodeGenOpts.HLSLOnlyWarnOnUnrollFail;
   PMBuilder.HLSLUnrollCountIsHint =
       LangOpts.HLSLVersion >= hlsl::LangStd::v202x;

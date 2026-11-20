@@ -105,8 +105,11 @@ Instruction *InstCombiner::scalarizePHI(ExtractElementInst &EI, PHINode *PN) {
           ExtractElementInst::Create(B0->getOperand(opId), Elt,
                                      B0->getOperand(opId)->getName() + ".Elt"),
           *B0);
-      Value *newPHIUser = InsertNewInstWith(
-          BinaryOperator::Create(B0->getOpcode(), scalarPHI, Op), *B0);
+      BinaryOperator *NewBO =
+          BinaryOperator::Create(B0->getOpcode(), scalarPHI, Op);
+      if (isa<FPMathOperator>(B0))
+        NewBO->copyFastMathFlags(B0);
+      Value *newPHIUser = InsertNewInstWith(NewBO, *B0);
       scalarPHI->addIncoming(newPHIUser, inBB);
     } else {
       // Scalarize PHI input:
@@ -194,7 +197,11 @@ Instruction *InstCombiner::visitExtractElementInst(ExtractElementInst &EI) {
         Value *newEI1 =
           Builder->CreateExtractElement(BO->getOperand(1), EI.getOperand(1),
                                         EI.getName()+".rhs");
-        return BinaryOperator::Create(BO->getOpcode(), newEI0, newEI1);
+        BinaryOperator *NewBO =
+            BinaryOperator::Create(BO->getOpcode(), newEI0, newEI1);
+        if (isa<FPMathOperator>(BO))
+          NewBO->copyFastMathFlags(BO);
+        return NewBO;
       }
     } else if (InsertElementInst *IE = dyn_cast<InsertElementInst>(I)) {
       // Extracting the inserted element?
@@ -659,10 +666,14 @@ static Value *BuildNew(Instruction *I, ArrayRef<Value*> NewOps) {
       assert(NewOps.size() == 2 && "icmp with #ops != 2");
       return new ICmpInst(I, cast<ICmpInst>(I)->getPredicate(),
                           NewOps[0], NewOps[1]);
-    case Instruction::FCmp:
+    case Instruction::FCmp: {
       assert(NewOps.size() == 2 && "fcmp with #ops != 2");
-      return new FCmpInst(I, cast<FCmpInst>(I)->getPredicate(),
-                          NewOps[0], NewOps[1]);
+      auto *NewCmp = new FCmpInst(I, cast<FCmpInst>(I)->getPredicate(),
+                                  NewOps[0], NewOps[1]);
+      // HLSL Change: preserve fast-math flags on reordered vector FCmp.
+      NewCmp->copyFastMathFlags(I);
+      return NewCmp;
+    }
     case Instruction::Trunc:
     case Instruction::ZExt:
     case Instruction::SExt:

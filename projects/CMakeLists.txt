@@ -6,6 +6,8 @@ add_subdirectory(include/Tracing) # DxcRuntimeEtw target
 
 if(HLSL_BUILD_DXILCONV)
   add_subdirectory(dxilconv)
+  enable_testing()
+  add_subdirectory(dxcb5)
 endif (HLSL_BUILD_DXILCONV)
 
 endif (WIN32)

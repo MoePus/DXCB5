@@ -3696,9 +3696,24 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
   }
 
   unsigned LowerBound = userOffset ? offset : UINT_MAX;
-  AddConstantToCB(cast<llvm::GlobalVariable>(constVal),
-                  constDecl->getQualifiedNameAsString(), constDecl->getType(),
-                  LowerBound, CB);
+  auto Name = constDecl->getQualifiedNameAsString();
+  AddConstantToCB(cast<llvm::GlobalVariable>(constVal), Name,
+                  constDecl->getType(), LowerBound, CB);
+
+  if (!CGM.getLangOpts().HLSLProfileForPreprocessor.empty() &&
+      constDecl->hasInit()) {
+    auto &Module = CGM.getModule();
+    auto &Context = Module.getContext();
+    auto *Value = CGM.EmitConstantExpr(constDecl->getInit(), constDecl->getType());
+    // SM5 reflection exposes initializers without making shader loads constant.
+    Metadata *Record[] = {
+        MDString::get(Context, CB.GetGlobalName()),
+        MDString::get(Context, Name),
+        ConstantAsMetadata::get(Value ? Value :
+            UndefValue::get(CGM.getTypes().ConvertTypeForMem(constDecl->getType())))};
+    Module.getOrInsertNamedMetadata("dxcb5.cbuffer.defaults")
+        ->addOperand(MDNode::get(Context, Record));
+  }
 
   // Save fieldAnnotation for the const var.
   DxilFieldAnnotation fieldAnnotation;

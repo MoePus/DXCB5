@@ -155,10 +155,18 @@ public:
 // HLSL Change Begin
   bool AllowFolding = false;
   bool SupportsVectors = false;
-  Scalarizer(bool AllowFolding) :
+  unsigned MaxPreservedWidth = 0;
+  Scalarizer(bool AllowFolding, unsigned MaxPreservedWidth = 0) :
     FunctionPass(ID),
-    AllowFolding(AllowFolding) {
+    AllowFolding(AllowFolding),
+    MaxPreservedWidth(MaxPreservedWidth) {
     initializeScalarizerPass(*PassRegistry::getPassRegistry());
+  }
+  bool shouldPreserveWidth(unsigned NumElems) const {
+    if (SupportsVectors)
+      return NumElems > 1;
+    return MaxPreservedWidth > 1 && NumElems > 1 &&
+           NumElems <= MaxPreservedWidth;
   }
 // HLSL Change End
   Scalarizer() :
@@ -448,7 +456,7 @@ template<typename Splitter>
 bool Scalarizer::splitBinary(Instruction &I, const Splitter &Split) {
   VectorType *VT = dyn_cast<VectorType>(I.getType());
   // HLSL Change - allow > 1 vectors where supported.
-  if (!VT || (SupportsVectors && VT->getNumElements() > 1))
+  if (!VT || shouldPreserveWidth(VT->getNumElements()))
     return false;
 
   unsigned NumElems = VT->getNumElements();
@@ -470,7 +478,7 @@ bool Scalarizer::splitBinary(Instruction &I, const Splitter &Split) {
 bool Scalarizer::visitSelectInst(SelectInst &SI) {
   VectorType *VT = dyn_cast<VectorType>(SI.getType());
   // HLSL Change - allow > 1 vectors where supported.
-  if (!VT || (SupportsVectors && VT->getNumElements() > 1))
+  if (!VT || shouldPreserveWidth(VT->getNumElements()))
     return false;
 
   unsigned NumElems = VT->getNumElements();
@@ -549,7 +557,7 @@ bool Scalarizer::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
 bool Scalarizer::visitCastInst(CastInst &CI) {
   VectorType *VT = dyn_cast<VectorType>(CI.getDestTy());
   // HLSL Change - allow > 1 vectors where supported.
-  if (!VT || (SupportsVectors && VT->getNumElements() > 1))
+  if (!VT || shouldPreserveWidth(VT->getNumElements()))
     return false;
 
   unsigned NumElems = VT->getNumElements();
@@ -577,6 +585,9 @@ bool Scalarizer::visitBitCastInst(BitCastInst &BCI) {
 
   // HLSL Change Begin - allow > 1 vectors where supported.
   if (SupportsVectors && (DstNumElems > 1 || SrcNumElems > 1))
+    return false;
+  if (MaxPreservedWidth > 1 && DstNumElems == SrcNumElems &&
+      shouldPreserveWidth(DstNumElems))
     return false;
   // HLSL Change End - allow > 1 vectors where supported.
 
@@ -631,7 +642,14 @@ bool Scalarizer::visitBitCastInst(BitCastInst &BCI) {
 bool Scalarizer::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
   VectorType *VT = dyn_cast<VectorType>(SVI.getType());
   // HLSL Change - allow > 1 vectors where supported.
-  if (!VT || (SupportsVectors && VT->getNumElements() > 1))
+  if (!VT)
+    return false;
+  unsigned InNumElems =
+      cast<VectorType>(SVI.getOperand(0)->getType())->getNumElements();
+  if (SupportsVectors && VT->getNumElements() > 1)
+    return false;
+  if (MaxPreservedWidth > 1 && shouldPreserveWidth(VT->getNumElements()) &&
+      shouldPreserveWidth(InNumElems))
     return false;
 
   unsigned NumElems = VT->getNumElements();
@@ -666,7 +684,7 @@ bool Scalarizer::visitShuffleVectorInst(ShuffleVectorInst &SVI) {
 bool Scalarizer::visitPHINode(PHINode &PHI) {
   VectorType *VT = dyn_cast<VectorType>(PHI.getType());
   // HLSL Change - allow > 1 vectors where supported.
-  if (!VT || (SupportsVectors && VT->getNumElements() > 1))
+  if (!VT || shouldPreserveWidth(VT->getNumElements()))
     return false;
 
   unsigned NumElems = VT->getNumElements();
@@ -703,7 +721,7 @@ bool Scalarizer::visitLoadInst(LoadInst &LI) {
 
   unsigned NumElems = Layout.VecTy->getNumElements();
   // HLSL Change Begin - allow > 1 vectors where supported.
-  if (SupportsVectors && NumElems > 1)
+  if (shouldPreserveWidth(NumElems))
     return false;
   // HLSL Change End - allow > 1 vectors where supported.
   IRBuilder<> Builder(LI.getParent(), &LI);
@@ -733,7 +751,7 @@ bool Scalarizer::visitStoreInst(StoreInst &SI) {
 
   unsigned NumElems = Layout.VecTy->getNumElements();
   // HLSL Change Begin - allow > 1 vectors where supported.
-  if (SupportsVectors && NumElems > 1)
+  if (shouldPreserveWidth(NumElems))
     return false;
   // HLSL Change End - allow > 1 vectors where supported.
   IRBuilder<> Builder(SI.getParent(), &SI);
@@ -867,6 +885,10 @@ bool Scalarizer::finish() {
 FunctionPass *llvm::createScalarizerPass(bool AllowFolding) {
   Scalarizer *pass = new Scalarizer(AllowFolding);
   return pass;
+}
+FunctionPass *llvm::createScalarizerPass(bool AllowFolding,
+                                         unsigned MaxPreservedWidth) {
+  return new Scalarizer(AllowFolding, MaxPreservedWidth);
 }
 // HLSL Change End
 FunctionPass *llvm::createScalarizerPass() {

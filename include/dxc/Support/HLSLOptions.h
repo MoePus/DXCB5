@@ -138,6 +138,10 @@ public:
   llvm::StringRef OutputFileForDependencies;  // OPT_write_dependencies_to
   std::string Preprocess;                     // OPT_P
   llvm::StringRef TargetProfile;              // OPT_target_profile
+  llvm::StringRef Dxcb5VertexBytecode;         // OPT_dxcb5_vs_dxbc
+  bool Dxcb5 = false;                          // OPT_fdxcb5
+  bool Dxcb5Cache = false;                     // OPT_fdxcb5_cache
+  bool Dxcb5NanSafe = false;                   // OPT_dxcb5_nan_safe
   llvm::StringRef VariableName;               // OPT_Vn
   llvm::StringRef PrivateSource;              // OPT_setprivate
   llvm::StringRef RootSignatureSource;        // OPT_setrootsignature

@@ -523,6 +523,7 @@ FunctionPass *createSampleProfileLoaderPass(StringRef Name);
 //
 FunctionPass *createScalarizerPass();
 FunctionPass *createScalarizerPass(bool NoOpt);
+FunctionPass *createScalarizerPass(bool NoOpt, unsigned MaxPreservedWidth);
 
 //===----------------------------------------------------------------------===//
 //

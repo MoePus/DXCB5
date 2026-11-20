@@ -94,13 +94,15 @@ private:
   bool DisableLineMarkers;
   bool DumpDefines;
   bool UseLineDirectives;
+  bool CompactLineGaps;
   bool IsFirstFileEntered;
 public:
   PrintPPOutputPPCallbacks(Preprocessor &pp, raw_ostream &os, bool lineMarkers,
-                           bool defines, bool UseLineDirectives)
+                           bool defines, bool UseLineDirectives,
+                           bool CompactLineGaps)
       : PP(pp), SM(PP.getSourceManager()), ConcatInfo(PP), OS(os),
         DisableLineMarkers(lineMarkers), DumpDefines(defines),
-        UseLineDirectives(UseLineDirectives) {
+        UseLineDirectives(UseLineDirectives), CompactLineGaps(CompactLineGaps) {
     CurLine = 0;
     CurFilename += "<uninit>";
     EmittedTokensOnThisLine = false;
@@ -204,6 +206,14 @@ void PrintPPOutputPPCallbacks::WriteLineInfo(unsigned LineNo,
 /// #line directive.  This returns false if already at the specified line, true
 /// if some newlines were emitted.
 bool PrintPPOutputPPCallbacks::MoveToLine(unsigned LineNo) {
+  if (CompactLineGaps) {
+    if (LineNo == CurLine)
+      return false;
+    CurLine = LineNo;
+    startNewLineIfNeeded(/*ShouldUpdateCurrentLine=*/false);
+    return true;
+  }
+
   // If this line is "close enough" to the original line, just print newlines,
   // otherwise print a #line directive.
   if (LineNo-CurLine <= 8) {
@@ -732,6 +742,12 @@ static void DoPrintMacros(Preprocessor &PP, raw_ostream *OS) {
 ///
 void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
                                      const PreprocessorOutputOptions &Opts) {
+  DoPrintPreprocessedInput(PP, OS, Opts, /*CompactLineGaps=*/false);
+}
+
+void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
+                                     const PreprocessorOutputOptions &Opts,
+                                     bool CompactLineGaps) {
   // Show macros with no output is handled specially.
   if (!Opts.ShowCPP) {
     assert(Opts.ShowMacros && "Not yet implemented!");
@@ -744,7 +760,8 @@ void clang::DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
   PP.SetCommentRetentionState(Opts.ShowComments, Opts.ShowMacroComments);
 
   PrintPPOutputPPCallbacks *Callbacks = new PrintPPOutputPPCallbacks(
-      PP, *OS, !Opts.ShowLineMarkers, Opts.ShowMacros, Opts.UseLineDirectives);
+      PP, *OS, !Opts.ShowLineMarkers, Opts.ShowMacros, Opts.UseLineDirectives,
+      CompactLineGaps);
 
   // Expand macros in pragmas with -fms-extensions.  The assumption is that
   // the majority of pragmas in such a file will be Microsoft pragmas.

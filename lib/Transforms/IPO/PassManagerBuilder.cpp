@@ -297,10 +297,11 @@ void PassManagerBuilder::addHLSLPasses(legacy::PassManagerBase &MPM) {
   if (!NoOpt)
     MPM.add(createSimplifyInstPass());
 
-  // scalarize vector to scalar
-  MPM.add(createScalarizerPass(!NoOpt /* AllowFolding */));
+  // scalarize vector to scalar (for DXCB5, preserve SM5 <2/3/4 x T> vectors)
+  MPM.add(createScalarizerPass(!NoOpt /* AllowFolding */,
+                               DXCB5PreserveVectors ? 4u : 0u));
 
-  // Remove vector instructions
+  // Remove dead/foldable vector instructions and promote vector allocas
   MPM.add(createDxilEliminateVectorPass());
 
   // Passes to handle [unroll]
@@ -708,12 +709,14 @@ void PassManagerBuilder::populateModulePassManager(
     // is not guaranteed for higher opt levels.
     MPM.add(createDxilLegalizeSampleOffsetPass());
     MPM.add(createDxilFinalizeModulePass());
-    MPM.add(createComputeViewIdStatePass());
-    MPM.add(createDxilDeadFunctionEliminationPass());
-    MPM.add(createDxilDeleteRedundantDebugValuesPass());
-    MPM.add(createNoPausePassesPass());
-    MPM.add(createDxilValidateWaveSensitivityPass());
-    MPM.add(createDxilEmitMetadataPass());
+    if (!DXCB5PreserveVectors) {
+      MPM.add(createComputeViewIdStatePass());
+      MPM.add(createDxilDeadFunctionEliminationPass());
+      MPM.add(createDxilDeleteRedundantDebugValuesPass());
+      MPM.add(createNoPausePassesPass());
+      MPM.add(createDxilValidateWaveSensitivityPass());
+      MPM.add(createDxilEmitMetadataPass());
+    }
   }
   // HLSL Change Ends.
   addExtensionsToPM(EP_OptimizerLast, MPM);

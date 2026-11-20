@@ -33,8 +33,9 @@ public:
   HRESULT CreateInstance2Impl(IMalloc *pMalloc, REFCLSID clsid, REFIID riid,
                               IUnknown **pResult) override;
 
-  HRESULT initialize();
-  HRESULT InitializeForDll(LPCSTR dllName, LPCSTR fnName);
+  HRESULT initialize(bool useExternalValidator = true);
+  HRESULT InitializeForDll(LPCSTR dllName, LPCSTR fnName,
+                           bool useExternalValidator = true);
 
   bool IsEnabled() const override { return DxCompilerSupport.IsEnabled(); }
 };

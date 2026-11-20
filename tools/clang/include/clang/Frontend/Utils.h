@@ -69,6 +69,9 @@ void InitializePreprocessor(Preprocessor &PP, const PreprocessorOptions &PPOpts,
 /// DoPrintPreprocessedInput - Implement -E mode.
 void DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream* OS,
                               const PreprocessorOutputOptions &Opts);
+void DoPrintPreprocessedInput(Preprocessor &PP, raw_ostream *OS,
+                              const PreprocessorOutputOptions &Opts,
+                              bool CompactLineGaps);
 
 /// An interface for collecting the dependencies of a compilation. Users should
 /// use \c attachToPreprocessor and \c attachToASTReader to get all of the

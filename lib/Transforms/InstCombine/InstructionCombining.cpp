@@ -869,9 +869,13 @@ Instruction *InstCombiner::FoldOpIntoPhi(Instruction &I) {
       else if (isa<ICmpInst>(CI))
         InV = Builder->CreateICmp(CI->getPredicate(), PN->getIncomingValue(i),
                                   C, "phitmp");
-      else
+      else {
         InV = Builder->CreateFCmp(CI->getPredicate(), PN->getIncomingValue(i),
                                   C, "phitmp");
+        // HLSL Change: preserve fast-math flags when folding FCmp into PHI.
+        if (auto *NewI = dyn_cast<Instruction>(InV))
+          NewI->copyFastMathFlags(&I);
+      }
       NewPN->addIncoming(InV, PN->getIncomingBlock(i));
     }
   } else if (I.getNumOperands() == 2) {
@@ -880,9 +884,14 @@ Instruction *InstCombiner::FoldOpIntoPhi(Instruction &I) {
       Value *InV = nullptr;
       if (Constant *InC = dyn_cast<Constant>(PN->getIncomingValue(i)))
         InV = ConstantExpr::get(I.getOpcode(), InC, C);
-      else
+      else {
         InV = Builder->CreateBinOp(cast<BinaryOperator>(I).getOpcode(),
                                    PN->getIncomingValue(i), C, "phitmp");
+        // HLSL Change: preserve fast-math flags when folding FP binop into PHI.
+        if (auto *NewI = dyn_cast<Instruction>(InV))
+          if (isa<FPMathOperator>(NewI))
+            NewI->copyFastMathFlags(&I);
+      }
       NewPN->addIncoming(InV, PN->getIncomingBlock(i));
     }
   } else {
@@ -1236,6 +1245,9 @@ static Value *CreateBinOpAsGiven(BinaryOperator &Inst, Value *LHS, Value *RHS,
     }
     if (isa<PossiblyExactOperator>(NewBO))
       NewBO->setIsExact(Inst.isExact());
+    // HLSL Change: preserve fast-math flags across vector shuffle binop folding.
+    if (isa<FPMathOperator>(NewBO))
+      NewBO->copyFastMathFlags(&Inst);
   }
   return BORes;
 }

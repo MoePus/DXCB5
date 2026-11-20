@@ -429,8 +429,8 @@ HRESULT DxcDllExtValidationLoader::CreateInstance2Impl(
   return DxCompilerSupport.CreateInstance2(Malloc, Clsid, Riid, ResultObject);
 }
 
-HRESULT
-DxcDllExtValidationLoader::InitializeForDll(LPCSTR dllName, LPCSTR fnName) {
+HRESULT DxcDllExtValidationLoader::InitializeForDll(
+    LPCSTR dllName, LPCSTR fnName, bool useExternalValidator) {
   // Load dxcompiler.dll
   HRESULT Result = DxCompilerSupport.InitializeForDll(dllName, fnName);
   // if dxcompiler.dll fails to load, return the failed HRESULT
@@ -438,6 +438,9 @@ DxcDllExtValidationLoader::InitializeForDll(LPCSTR dllName, LPCSTR fnName) {
     FailureReason = FailedCompilerLoad;
     return Result;
   }
+
+  if (!useExternalValidator)
+    return S_OK;
 
   // now handle external dxil.dll
   const char *EnvVarVal = std::getenv("DXC_DXIL_DLL_PATH");
@@ -465,8 +468,9 @@ DxcDllExtValidationLoader::InitializeForDll(LPCSTR dllName, LPCSTR fnName) {
   return Result;
 }
 
-HRESULT DxcDllExtValidationLoader::initialize() {
-  return InitializeForDll(kDxCompilerLib, "DxcCreateInstance");
+HRESULT DxcDllExtValidationLoader::initialize(bool useExternalValidator) {
+  return InitializeForDll(kDxCompilerLib, "DxcCreateInstance",
+                          useExternalValidator);
 }
 
 } // namespace dxc

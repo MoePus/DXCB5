@@ -393,7 +393,10 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
     Builder.defineMacro("__SHADER_STAGE_AMPLIFICATION",Twine((unsigned)hlsl::DXIL::ShaderKind::Amplification));
     Builder.defineMacro("__SHADER_STAGE_MESH",    Twine((unsigned)hlsl::DXIL::ShaderKind::Mesh));
     Builder.defineMacro("__SHADER_STAGE_LIBRARY", Twine((unsigned)hlsl::DXIL::ShaderKind::Library));
-    const hlsl::ShaderModel *SM = hlsl::ShaderModel::GetByName(LangOpts.HLSLProfile.c_str());
+    const hlsl::ShaderModel *SM = hlsl::ShaderModel::GetByName(
+        LangOpts.HLSLProfileForPreprocessor.empty()
+            ? LangOpts.HLSLProfile
+            : LangOpts.HLSLProfileForPreprocessor);
     // The current shader stage itself
     Builder.defineMacro("__SHADER_TARGET_STAGE", Twine((unsigned)SM->GetKind()));
     // Add target versions

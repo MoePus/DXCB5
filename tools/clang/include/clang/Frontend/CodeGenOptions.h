@@ -183,6 +183,8 @@ public:
   bool HLSLHighLevel = false;
   /// Whether we allow preserve intermediate values
   bool HLSLAllowPreserveValues = false;
+  /// Preserve native <2/3/4 x T> vectors for the DXCB5 SM5 backend.
+  bool DXCB5PreserveVectors = false;
   /// Whether we fail compilation if loop fails to unroll
   bool HLSLOnlyWarnOnUnrollFail = false;
   /// Whether use legacy resource reservation.

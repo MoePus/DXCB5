@@ -282,6 +282,16 @@ def external_lib : Separate<["-", "/"], "external">, Group<hlslcore_Group>, Flag
   HelpText<"External DLL name to load for compiler support">;
 def external_fn : Separate<["-", "/"], "external-fn">, Group<hlslcore_Group>, Flags<[DriverOption, RewriteOption, HelpHidden]>,
   HelpText<"External function name to load for compiler support">;
+def fdxcb5 : Flag<["-"], "fdxcb5">, Flags<[CoreOption, HelpHidden]>,
+  Group<hlslcore_Group>;
+def fdxcb5_cache : Flag<["-"], "fdxcb5-cache">, Flags<[CoreOption, HelpHidden]>,
+  Group<hlslcore_Group>;
+def dxcb5_vs_dxbc : Separate<["--"], "vs-dxbc">, Flags<[CoreOption]>,
+  MetaVarName<"<file>">, Group<hlslcomp_Group>,
+  HelpText<"DXCB5: Input vertex shader bytecode for ps_5_0">;
+def dxcb5_nan_safe : Flag<["--"], "nan-safe">, Flags<[CoreOption]>,
+  Group<hlslcomp_Group>,
+  HelpText<"DXCB5: Preserve strict NaN semantics in floating-point optimizations">;
 def fcgl : Flag<["-", "/"], "fcgl">, Group<hlslcore_Group>, Flags<[CoreOption, HelpHidden]>,
   HelpText<"Generate high-level code only">;
 def preserve_intermediate_values : Flag<["-", "/"], "preserve-intermediate-values">, Group<hlslcore_Group>, Flags<[CoreOption, HelpHidden]>,

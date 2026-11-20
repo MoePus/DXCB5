@@ -501,6 +501,52 @@ static std::string getPreprocessOutput(InputArgList &Args,
 
 namespace options {
 
+static bool ValidateDxcb5Options(const InputArgList &args,
+                                 unsigned flagsToInclude, const DxcOpts &opts,
+                                 llvm::raw_ostream &errors) {
+  if (!opts.Dxcb5) {
+    if (!args.hasArg(OPT_dxcb5_vs_dxbc, OPT_fdxcb5_cache, OPT_dxcb5_nan_safe))
+      return true;
+    errors << "--vs-dxbc, --nan-safe, and -fdxcb5-cache are only supported by DXCB5.";
+    return false;
+  }
+
+  const OptSpecifier unsupported[] = {
+      OPT_hlslutil_Group, OPT_spirv_Group, OPT_metal, OPT_recompile,
+      OPT_Fc, OPT_Fd, OPT_Fh, OPT_Fi, OPT_Fre, OPT_Frs, OPT_Fsh,
+      OPT_Vn, OPT_Cc, OPT_Ni, OPT_No, OPT_Lx, OPT__SLASH_Zi, OPT_Zs,
+      OPT_Zsb, OPT_Zss, OPT_fcgl, OPT_ast_dump, OPT_ast_dump_implicit,
+      OPT_Odump, OPT_dump_dependencies, OPT_write_dependencies,
+      OPT_write_dependencies_to, OPT_verify, OPT_external_lib,
+      OPT_rootsig_define, OPT_force_rootsig_ver, OPT_force_rootsig_ver_,
+      OPT_validator_version,
+  };
+  for (OptSpecifier id : unsupported) {
+    if (const Arg *arg = args.getLastArg(id)) {
+      errors << "DXCB5 does not support " << arg->getSpelling() << ".";
+      return false;
+    }
+  }
+
+  if (opts.TargetProfile != "vs_5_0" && opts.TargetProfile != "ps_5_0") {
+    errors << "DXCB5 requires target profile vs_5_0 or ps_5_0.";
+    return false;
+  }
+  if (opts.TargetProfile == "ps_5_0" && opts.Dxcb5VertexBytecode.empty()) {
+    errors << "DXCB5 requires --vs-dxbc <file> for ps_5_0.";
+    return false;
+  }
+  if (opts.TargetProfile == "vs_5_0" && args.hasArg(OPT_dxcb5_vs_dxbc)) {
+    errors << "DXCB5 only accepts --vs-dxbc for ps_5_0.";
+    return false;
+  }
+  if ((flagsToInclude & DriverOption) && opts.OutputObject.empty()) {
+    errors << "DXCB5 requires -Fo <file>.";
+    return false;
+  }
+  return true;
+}
+
 /// Reads all options from the given argument strings, populates opts, and
 /// validates reporting errors and warnings.
 int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
@@ -558,6 +604,9 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
     }
   }
 
+  opts.Dxcb5 = Args.hasArg(OPT_fdxcb5);
+  opts.Dxcb5Cache = Args.hasArg(OPT_fdxcb5_cache);
+  opts.Dxcb5NanSafe = Args.hasArg(OPT_dxcb5_nan_safe);
   opts.ShowHelp = Args.hasFlag(OPT_help, OPT_INVALID, false);
   opts.ShowHelp |= (opts.ShowHelpHidden =
                         Args.hasFlag(OPT__help_hidden, OPT_INVALID, false));
@@ -607,6 +656,11 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   if (opts.TargetProfile.empty()) {
     opts.TargetProfile = Args.getLastArgValue(OPT_target_profile);
   }
+
+  opts.Dxcb5VertexBytecode = Args.getLastArgValue(OPT_dxcb5_vs_dxbc);
+  opts.OutputObject = Args.getLastArgValue(OPT_Fo);
+  if (!ValidateDxcb5Options(Args, flagsToInclude, opts, errors))
+    return 1;
 
   if (opts.IsLibraryProfile()) {
     // Don't bother erroring out when entry is specified.  We weren't always
@@ -669,7 +723,6 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.ExtractPrivateFile = Args.getLastArgValue(OPT_getprivate);
   opts.Enable16BitTypes =
       Args.hasFlag(OPT_enable_16bit_types, OPT_INVALID, false);
-  opts.OutputObject = Args.getLastArgValue(OPT_Fo);
   opts.OutputHeader = Args.getLastArgValue(OPT_Fh);
   opts.OutputWarningsFile = Args.getLastArgValue(OPT_Fe);
   opts.OutputReflectionFile = Args.getLastArgValue(OPT_Fre);
@@ -910,7 +963,9 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
   opts.DisaseembleHex = Args.hasFlag(OPT_Lx, OPT_INVALID, false);
   opts.LegacyMacroExpansion =
       Args.hasFlag(OPT_flegacy_macro_expansion, OPT_INVALID, false);
+  // SM5.0 reserves explicitly bound registers even for unused resources.
   opts.LegacyResourceReservation =
+      opts.Dxcb5 ||
       Args.hasFlag(OPT_flegacy_resource_reservation, OPT_INVALID, false);
   opts.ExportShadersOnly =
       Args.hasFlag(OPT_export_shaders_only, OPT_INVALID, false);

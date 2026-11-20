@@ -128,6 +128,7 @@ public:
   bool PrepareForLTO;
   bool HLSLHighLevel = false; // HLSL Change
   bool HLSLAllowPreserveValues = false; // HLSL Change
+  bool DXCB5PreserveVectors = false; // DXCB5 Change
   bool HLSLOnlyWarnOnUnrollFail = false; // HLSL Change
   bool HLSLUnrollCountIsHint = false;    // HLSL Change
   hlsl::HLSLExtensionsCodegenHelper *HLSLExtensionsCodeGen = nullptr; // HLSL Change

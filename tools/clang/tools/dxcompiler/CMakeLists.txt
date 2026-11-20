@@ -1,4 +1,4 @@
-﻿# Copyright (C) Microsoft Corporation. All rights reserved.
+# Copyright (C) Microsoft Corporation. All rights reserved.
 # This file is distributed under the University of Illinois Open Source License.
 # See LICENSE.TXT for details.
 
@@ -131,6 +131,10 @@ if (MSVC)
   add_dependencies(dxcompiler DxcEtw)
 endif()
 target_link_libraries(dxcompiler PRIVATE ${LIBRARIES})
+if(TARGET DXCB5Backend)
+  target_compile_definitions(dxcompiler PRIVATE ENABLE_DXCB5)
+  target_link_libraries(dxcompiler PRIVATE DXCB5Backend)
+endif()
 if (ENABLE_SPIRV_CODEGEN)
   target_link_libraries(dxcompiler PRIVATE clangSPIRV)
 endif (ENABLE_SPIRV_CODEGEN)

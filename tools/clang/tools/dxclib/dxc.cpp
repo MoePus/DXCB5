@@ -328,6 +328,11 @@ int DxcContext::ActOnBlob(IDxcBlob *pBlob, IDxcBlob *pDebugBlob,
     return retVal;
   }
 
+  if (m_Opts.Dxcb5) {
+    WriteBlobToFile(pBlob, m_Opts.OutputObject, m_Opts.DefaultTextCodePage);
+    return retVal;
+  }
+
   // Write the output blob.
   if (!m_Opts.OutputObject.empty()) {
     // For backward compatability: fxc requires /Fo for /extractrootsignature
@@ -845,7 +850,7 @@ int DxcContext::Compile() {
       llvm::StringRef TargetProfile = m_Opts.TargetProfile;
       const hlsl::ShaderModel *SM =
           hlsl::ShaderModel::GetByName(m_Opts.TargetProfile.str().c_str());
-      if (SM->IsValid() && SM->GetMajor() < 6) {
+      if (!m_Opts.Dxcb5 && SM->IsValid() && SM->GetMajor() < 6) {
         TargetProfile = hlsl::ShaderModel::Get(SM->GetKind(), 6, 0)->GetName();
         std::string versionWarningString =
             "warning: Promoting older shader model profile to 6.0 version.";
@@ -1467,7 +1472,7 @@ int dxc::main(int argc, const char **argv_) {
             dxcSupport.InitializeForDll(dxcOpts.ExternalLib.str().c_str(),
                                         dxcOpts.ExternalFn.str().c_str());
       else
-        dllResult = dxcSupport.initialize();
+        dllResult = dxcSupport.initialize(!dxcOpts.Dxcb5);
 
       if (DXC_FAILED(dllResult)) {
         switch (dxcSupport.getFailureReason()) {
@@ -1493,7 +1498,7 @@ int dxc::main(int argc, const char **argv_) {
       }
 
       // if no errors setting up, print the log string as stdout
-      if (dxcOpts.Verbose)
+      if (dxcOpts.Verbose && !dxcOpts.Dxcb5)
         fprintf(stdout, "Loading external dxil.dll from %s",
                 dxcSupport.getDxilDllPath().c_str());
     }
@@ -1507,7 +1512,9 @@ int dxc::main(int argc, const char **argv_) {
       llvm::raw_string_ostream versionStream(version);
       context.GetCompilerVersionInfo(versionStream);
       optionTable->PrintHelp(
-          helpStream, "dxc.exe", "HLSL Compiler" VERSION_STRING_SUFFIX,
+          helpStream, dxcOpts.Dxcb5 ? "dxcb5.exe" : "dxc.exe",
+          dxcOpts.Dxcb5 ? "HLSL to SM5.0 DXBC Compiler"
+                       : "HLSL Compiler" VERSION_STRING_SUFFIX,
           versionStream.str().c_str(), dxcOpts.ShowHelpHidden);
       helpStream.flush();
       WriteUtf8ToConsoleSizeT(helpString.data(), helpString.size());
