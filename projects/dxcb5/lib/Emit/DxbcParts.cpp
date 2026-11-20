@@ -1,0 +1,333 @@
+// Distributed under the University of Illinois Open Source License.
+#include "DxbcParts.h"
+#include "dxcb5/DxbcWriter.h"
+#include "Support/DXIncludes.h"
+#include "dxc/DxilContainer/DxilContainer.h"
+#include <algorithm>
+#include <cstring>
+#include <tuple>
+
+using namespace hlsl;
+
+namespace dxcb5 {
+namespace {
+constexpr auto LegacyOutputSignature = FourCC('O', 'S', 'G', 'N');
+constexpr auto StreamOutputSignature = FourCC('O', 'S', 'G', '5');
+constexpr auto ExtendedOutputSignature = FourCC('O', 'S', 'G', '1');
+constexpr auto ShaderCode = FourCC('S', 'H', 'E', 'X');
+constexpr auto LegacyShaderCode = FourCC('S', 'H', 'D', 'R');
+constexpr auto ResourceDefinitionTag = FourCC('R', 'D', '1', '1');
+constexpr uint32_t RdefHeaderSize = 60;
+constexpr uint32_t RdefBufferSize = 24;
+constexpr uint32_t RdefBindingSize = 32;
+constexpr uint32_t RdefVariableSize = 40;
+constexpr uint32_t RdefTypeSize = 36;
+constexpr uint32_t RdefMemberSize = 12;
+
+uint32_t ReadWord(llvm::StringRef data, size_t offset) {
+  uint32_t word;
+  std::memcpy(&word, data.data() + offset, sizeof(word));
+  return word;
+}
+
+class BytePart {
+public:
+  std::vector<uint8_t> Data;
+
+  uint32_t Size() const { return static_cast<uint32_t>(Data.size()); }
+
+  void WriteWords(std::initializer_list<uint32_t> words) {
+    auto *start = reinterpret_cast<const uint8_t *>(words.begin());
+    Data.insert(Data.end(), start, start + words.size() * sizeof(uint32_t));
+  }
+
+  uint32_t AppendString(llvm::StringRef str) {
+    auto offset = Size();
+    Data.insert(Data.end(), str.bytes_begin(), str.bytes_end());
+    Data.push_back(0);
+    return offset;
+  }
+
+  void PatchWord(uint32_t offset, uint32_t value) {
+    std::memcpy(Data.data() + offset, &value, sizeof(value));
+  }
+
+  uint32_t AppendBytes(const std::vector<uint8_t> &bytes) {
+    const auto offset = Size();
+    Data.insert(Data.end(), bytes.begin(), bytes.end());
+    Align();
+    return offset;
+  }
+
+  void Align() {
+    constexpr uint32_t Alignment = sizeof(uint32_t);
+    Data.resize((Size() + Alignment - 1) & ~(Alignment - 1));
+  }
+};
+
+const DxilPartHeader *FindPart(const DxilContainerHeader *container,
+                              std::initializer_list<uint32_t> tags) {
+  for (auto tag : tags)
+    if (auto *part = GetDxilPartByType(container, static_cast<DxilFourCC>(tag)))
+      return part;
+  return nullptr;
+}
+
+bool HasVertexCode(const DxilContainerHeader *container) {
+  const auto *part = FindPart(container, {ShaderCode, LegacyShaderCode});
+  if (!part || part->PartSize < 2 * sizeof(uint32_t))
+    return false;
+  llvm::StringRef code(GetDxilPartData(part), part->PartSize);
+  return ReadWord(code, 0) == ENCODE_D3D10_SB_TOKENIZED_PROGRAM_VERSION_TOKEN(
+                                  D3D10_SB_VERTEX_SHADER, 5, 0);
+}
+
+bool ReadSignatureElement(llvm::StringRef data, size_t offset,
+                          SignatureElement &element, std::string &error) {
+  const uint32_t stringOffset = ReadWord(data, offset);
+  if (stringOffset >= data.size()) {
+    error = "DXBC signature name points outside its part";
+    return false;
+  }
+  auto name = data.drop_front(stringOffset);
+  const auto end = name.find('\0');
+  if (end == 0 || end == llvm::StringRef::npos) {
+    error = "DXBC signature has an invalid semantic name";
+    return false;
+  }
+  element.Semantic = name.substr(0, end).str();
+  element.SemanticIndex = ReadWord(data, offset + 4);
+  element.SystemValue = ReadWord(data, offset + 8);
+  element.ComponentType = ReadWord(data, offset + 12);
+  element.Register = ReadWord(data, offset + 16);
+  if (element.Register >= D3D11_VS_OUTPUT_REGISTER_COUNT) {
+    error = "DXBC vertex output register exceeds SM5 limits";
+    return false;
+  }
+  uint32_t masks = ReadWord(data, offset + 20);
+  element.Mask = masks & 0xfu;
+  element.UsedMask = element.Mask & ~(masks >> 8);
+  if (!element.Mask || element.ComponentType < D3D_REGISTER_COMPONENT_UINT32 ||
+      element.ComponentType > D3D_REGISTER_COMPONENT_FLOAT32) {
+    error = "DXBC signature has an unsupported component type or mask";
+    return false;
+  }
+  return true;
+}
+
+uint32_t EncodedSemantic(const SignatureElement &element) {
+  if (element.SystemValue == D3D_NAME_TARGET ||
+      element.SystemValue == D3D_NAME_DEPTH ||
+      element.SystemValue == D3D_NAME_DEPTH_GREATER_EQUAL ||
+      element.SystemValue == D3D_NAME_DEPTH_LESS_EQUAL ||
+      element.SystemValue == D3D_NAME_COVERAGE)
+    return D3D_NAME_UNDEFINED;
+  return element.SystemValue;
+}
+
+uint32_t PackedType(uint16_t low, uint16_t high) {
+  return static_cast<uint32_t>(low) | (static_cast<uint32_t>(high) << 16);
+}
+
+void WriteBinding(BytePart &out, uint32_t type, uint32_t returnType,
+                  uint32_t dimension, uint32_t samples, uint32_t slot,
+                  uint32_t count, uint32_t flags) {
+  out.WriteWords({0, type, returnType, dimension, samples, slot, count, flags});
+}
+
+uint32_t BindingSamples(const BoundResource &resource) {
+  if (resource.Type == D3D_SIT_STRUCTURED ||
+      resource.Type == D3D_SIT_UAV_RWSTRUCTURED ||
+      resource.Type == D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER)
+    return resource.Stride;
+  if (resource.Type == D3D_SIT_BYTEADDRESS ||
+      resource.Type == D3D_SIT_UAV_RWBYTEADDRESS)
+    return 0;
+  if (resource.Dimension == D3D_SRV_DIMENSION_TEXTURE2DMS ||
+      resource.Dimension == D3D_SRV_DIMENSION_TEXTURE2DMSARRAY)
+    return resource.SampleCount;
+  return (resource.Type == D3D_SIT_TEXTURE ||
+          resource.Type == D3D_SIT_UAV_RWTYPED)
+             ? UINT32_MAX
+             : 0;
+}
+
+uint32_t ResourceFlags(const BoundResource &resource) {
+  if (resource.Type == D3D_SIT_TEXTURE ||
+      resource.Type == D3D_SIT_UAV_RWTYPED)
+    return (resource.Components - 1) * D3D_SIF_TEXTURE_COMPONENT_0;
+  if (resource.Type == D3D_SIT_STRUCTURED ||
+      resource.Type == D3D_SIT_BYTEADDRESS ||
+      resource.Type == D3D_SIT_UAV_RWSTRUCTURED ||
+      resource.Type == D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER ||
+      resource.Type == D3D_SIT_UAV_RWBYTEADDRESS)
+    return 0u;
+  return resource.Comparison ? D3D_SIF_COMPARISON_SAMPLER : 0u;
+}
+
+uint32_t WriteType(BytePart &out, const ConstantVariable &variable) {
+  struct MemberDesc { uint32_t Name, Type, Offset; };
+  std::vector<MemberDesc> members;
+  members.reserve(variable.Members.size());
+  for (const auto &member : variable.Members) {
+    const auto name = out.AppendString(member.Name);
+    members.push_back({name, WriteType(out, member), member.Offset});
+  }
+  const auto name = variable.TypeName.empty() ? 0 : out.AppendString(variable.TypeName);
+  out.Align();
+  const auto fields = members.empty() ? 0 : out.Size();
+  for (const auto &member : members)
+    out.WriteWords({member.Name, member.Type, member.Offset});
+  const auto type = out.Size();
+  out.WriteWords({PackedType(variable.Class, variable.Type),
+                  PackedType(variable.Rows, variable.Columns),
+                  PackedType(variable.Elements, static_cast<uint16_t>(members.size())),
+                  fields, 0, 0, 0, 0, name});
+  return type;
+}
+
+void WriteVariables(BytePart &out, const ConstantBuffer &buffer,
+                    uint32_t descriptor) {
+  const auto firstVariable = out.Size();
+  out.PatchWord(descriptor + 8, buffer.Variables.empty() ? 0 : firstVariable);
+  for (const auto &variable : buffer.Variables) {
+    out.WriteWords({0, variable.Offset, variable.Size,
+                    variable.Used ? D3D_SVF_USED : 0u,
+                    0, 0, UINT32_MAX, 0, UINT32_MAX, 0});
+  }
+  auto offset = firstVariable;
+  for (const auto &variable : buffer.Variables) {
+    out.PatchWord(offset, out.AppendString(variable.Name));
+    out.Align();
+    out.PatchWord(offset + 16, WriteType(out, variable));
+    if (!variable.DefaultValue.empty())
+      out.PatchWord(offset + 20, out.AppendBytes(variable.DefaultValue));
+    offset += RdefVariableSize;
+  }
+}
+} // namespace
+
+std::vector<uint8_t>
+EncodeSignature(const std::vector<SignatureElement> &elements, bool output) {
+  // SM5 signature consumers expect register order with shared lanes adjacent.
+  std::vector<const SignatureElement *> ordered;
+  ordered.reserve(elements.size());
+  for (const auto &element : elements)
+    ordered.push_back(&element);
+  std::stable_sort(ordered.begin(), ordered.end(), [](auto *left, auto *right) {
+    return std::tie(left->Register, left->Mask) < std::tie(right->Register, right->Mask);
+  });
+
+  BytePart part;
+  part.WriteWords({static_cast<uint32_t>(ordered.size()),
+                   sizeof(D3D10_INTERNALSHADER_SIGNATURE)});
+  for (const auto *element : ordered) {
+    const uint32_t used =
+        output ? (~element->UsedMask & 0xfu) : element->UsedMask;
+    part.WriteWords({0, element->SemanticIndex, EncodedSemantic(*element),
+                     element->ComponentType, element->Register,
+                     element->Mask | (used << 8)});
+  }
+  uint32_t offset = sizeof(D3D10_INTERNALSHADER_SIGNATURE);
+  for (const auto *element : ordered) {
+    part.PatchWord(offset, part.AppendString(element->Semantic));
+    offset += sizeof(D3D10_INTERNALSHADER_PARAMETER);
+  }
+  part.Align();
+  return std::move(part.Data);
+}
+
+bool ReadVertexOutputSignature(llvm::StringRef bytecode,
+                               std::vector<SignatureElement> &output,
+                               std::string &error,
+                               llvm::StringRef *signaturePart) {
+  auto *container = IsDxilContainerLike(bytecode.data(), bytecode.size());
+  if (!container || !IsValidDxilContainer(container, bytecode.size()) ||
+      !HasVertexCode(container)) {
+    error = "link input is not an SM5.0 DXBC vertex shader";
+    return false;
+  }
+  const auto *part = FindPart(container, {LegacyOutputSignature,
+                                         StreamOutputSignature,
+                                         ExtendedOutputSignature});
+  if (!part || part->PartSize < sizeof(D3D10_INTERNALSHADER_SIGNATURE)) {
+    error = "DXBC vertex shader has no output signature";
+    return false;
+  }
+  llvm::StringRef data(GetDxilPartData(part), part->PartSize);
+  bool streamed = part->PartFourCC != LegacyOutputSignature;
+  size_t stride = sizeof(D3D10_INTERNALSHADER_PARAMETER);
+  if (streamed)
+    stride = part->PartFourCC == StreamOutputSignature
+                 ? sizeof(D3D11_INTERNALSHADER_PARAMETER_FOR_GS)
+                 : sizeof(D3D11_INTERNALSHADER_PARAMETER_11_1);
+  const auto count = ReadWord(data, 0);
+  auto offset = ReadWord(data, 4);
+  if (offset < sizeof(D3D10_INTERNALSHADER_SIGNATURE) || offset > data.size() ||
+      count > (data.size() - offset) / stride) {
+    error = "DXBC signature table is out of bounds";
+    return false;
+  }
+  std::vector<SignatureElement> elements;
+  elements.reserve(count);
+  for (uint32_t index = 0; index < count; ++index, offset += stride) {
+    SignatureElement element;
+    if (streamed && ReadWord(data, offset)) {
+      error = "DXBC vertex shader output signature has a nonzero stream";
+      return false;
+    }
+    if (!ReadSignatureElement(data, offset + (streamed ? 4 : 0), element, error))
+      return false;
+    elements.push_back(std::move(element));
+  }
+  output = std::move(elements);
+  if (signaturePart)
+    *signaturePart = llvm::StringRef(reinterpret_cast<const char *>(part),
+                                    sizeof(DxilPartHeader) + part->PartSize);
+  return true;
+}
+
+std::vector<uint8_t> EncodeResourceDefinitions(const MirProgram &program) {
+  BytePart out;
+  const auto bufferCount = static_cast<uint32_t>(program.ConstantBuffers.size());
+  const auto bindingCount = bufferCount + program.Resources.size();
+  const auto firstBuffer =
+      static_cast<uint32_t>(RdefHeaderSize + bindingCount * RdefBindingSize);
+  const uint32_t target = program.ShaderStage == Stage::Pixel ? 0xffff0500u
+                                                               : 0xfffe0500u;
+  out.WriteWords({bufferCount, bufferCount ? firstBuffer : 0,
+                  static_cast<uint32_t>(bindingCount),
+                  bindingCount ? RdefHeaderSize : 0, target, 0, 0,
+                  ResourceDefinitionTag, RdefHeaderSize, RdefBufferSize,
+                  RdefBindingSize, RdefVariableSize, RdefTypeSize, RdefMemberSize,
+                  0});
+  for (const auto &buffer : program.ConstantBuffers)
+    WriteBinding(out, D3D_SIT_CBUFFER, 0, 0, 0, buffer.Slot, 1, 0);
+  for (const auto &resource : program.Resources)
+    WriteBinding(out, resource.Type, resource.ReturnType, resource.Dimension,
+                 BindingSamples(resource), resource.Slot, resource.Count,
+                 ResourceFlags(resource));
+  for (const auto &buffer : program.ConstantBuffers) {
+    out.WriteWords({0, static_cast<uint32_t>(buffer.Variables.size()), 0,
+                    buffer.Size, 0, D3D_CT_CBUFFER});
+  }
+  uint32_t binding = RdefHeaderSize, descriptor = firstBuffer;
+  for (const auto &buffer : program.ConstantBuffers) {
+    const auto name = out.AppendString(buffer.Name);
+    out.PatchWord(binding, name);
+    out.PatchWord(descriptor, name);
+    out.Align();
+    WriteVariables(out, buffer, descriptor);
+    binding += RdefBindingSize;
+    descriptor += RdefBufferSize;
+  }
+  for (const auto &resource : program.Resources) {
+    out.PatchWord(binding, out.AppendString(resource.Name));
+    binding += RdefBindingSize;
+  }
+  out.PatchWord(24, out.AppendString("DXCB5"));
+  out.Align();
+  return std::move(out.Data);
+}
+
+} // namespace dxcb5
