@@ -419,6 +419,16 @@ int main(int argc, char **argv) {
       std::printf("PASS optional %s (%s %s)\n", argv[i], target, entry);
     }
 
+    // Release all COM objects backed by the proxy's loaded FXC/DXC DLLs before
+    // unloading the proxy DLL and verifying clean peer-slot disconnect.
+    vsBlob.Reset();
+    psBlob.Reset();
+    errBlob.Reset();
+    refl.Reset();
+    Require(FreeLibrary(proxy) != 0, "FreeLibrary(proxy) failed");
+    Require(peerSlot.NativeDispatch == nullptr,
+            "Expected FreeLibrary(proxy) to clear peer PeloaderBridgeSlot");
+
     std::printf("DXCB5UnityProxyTest PASSED\n");
     return 0;
   } catch (const std::exception &e) {

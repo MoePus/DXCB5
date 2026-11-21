@@ -6,7 +6,6 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -49,9 +48,12 @@ std::wstring GetConfigDir() {
   if (n > 0 && n < MAX_PATH)
     return std::wstring(buf, n);
   n = GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH);
-  if (!n || n >= MAX_PATH)
-    return L".";
-  return std::wstring(buf, n) + L"\\DXCB5Unity";
+  if (n > 0 && n < MAX_PATH)
+    return std::wstring(buf, n) + L"\\DXCB5Unity";
+  n = GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH);
+  if (n > 0 && n < MAX_PATH)
+    return std::wstring(buf, n) + L"\\AppData\\Local\\DXCB5Unity";
+  return L".";
 }
 
 ProxyConfig LoadConfig() {
@@ -175,7 +177,7 @@ void AppendLogLine(const std::string &line) {
   // Rotate stats.log -> stats.log.1 around 512 KB so it never grows unbounded.
   WIN32_FILE_ATTRIBUTE_DATA fad{};
   if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad) &&
-      fad.nFileSizeLow > 512 * 1024) {
+      (fad.nFileSizeHigh > 0 || fad.nFileSizeLow > 512 * 1024)) {
     const std::wstring prevPath = dir + L"\\stats.log.1";
     MoveFileExW(logPath.c_str(), prevPath.c_str(), MOVEFILE_REPLACE_EXISTING);
   }
@@ -518,6 +520,7 @@ namespace dxcb5_proxy {
 
 PeloaderBridgeSlot g_BridgeSlot = {0, 0, 0, TLS_OUT_OF_INDEXES, nullptr,
                                    nullptr};
+bool g_IsNativeInstance = false;
 
 HRESULT WINAPI D3DCompile_Native(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
@@ -614,8 +617,10 @@ HRESULT WINAPI D3DCompile2_Native(
                              ppCode, ppErrorMsgs);
   }
   auto &libs = GetLibs();
-  if (!libs.FxcCompile2)
+  if (!libs.FxcCompile2) {
+    AppendDiagLine("DIAG\tD3DCompile2\tFxcCompile2 is null -> E_FAIL\n");
     return E_FAIL;
+  }
   return libs.FxcCompile2(pSrcData, SrcDataSize, pSourceName, pDefines,
                           pInclude, pEntrypoint, pTarget, Flags1, Flags2,
                           SecondaryDataFlags, pSecondaryData, SecondaryDataSize,
@@ -656,7 +661,39 @@ const NativeDispatchTable g_LocalDispatch = {
     &D3DWriteBlobToFile_Native,
 };
 
-bool g_IsNativeInstance = false;
+PeloaderBridgeSlot *g_ConnectedPeerSlot = nullptr;
+
+bool TryClaimBridgeSlot(void *val, DWORD pid, DWORD idx) {
+  __try {
+    auto *slot = static_cast<PeloaderBridgeSlot *>(val);
+    if (slot->Magic1 == kBridgeMagic1 && slot->Magic2 == kBridgeMagic2 &&
+        slot->Pid == pid && slot->Self == slot && slot->TlsIndex == idx &&
+        slot != &g_BridgeSlot) {
+      InterlockedExchangePointer(
+          &slot->NativeDispatch,
+          const_cast<NativeDispatchTable *>(&g_LocalDispatch));
+      slot->TlsIndex = TLS_OUT_OF_INDEXES;
+      g_ConnectedPeerSlot = slot;
+      return true;
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+  return false;
+}
+
+void SafeDisconnectPeerSlot(PeloaderBridgeSlot *slot) {
+  if (!slot)
+    return;
+  __try {
+    if (slot->Magic1 == kBridgeMagic1 && slot->Magic2 == kBridgeMagic2 &&
+        slot->Self == slot) {
+      InterlockedCompareExchangePointer(
+          &slot->NativeDispatch, nullptr,
+          const_cast<NativeDispatchTable *>(&g_LocalDispatch));
+    }
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+  }
+}
 
 void ConnectPeerPeloaderInstance() {
   const DWORD savedErr = GetLastError();
@@ -675,18 +712,12 @@ void ConnectPeerPeloaderInstance() {
     const DWORD prot = mbi.Protect & 0xFF;
     if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE)
       continue;
-    const uintptr_t regionEnd =
-        reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    if (addr + sizeof(PeloaderBridgeSlot) > regionEnd)
+    const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+    const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+    if (addr < regionBase || regionEnd < addr ||
+        (regionEnd - addr) < sizeof(PeloaderBridgeSlot))
       continue;
-    auto *slot = static_cast<PeloaderBridgeSlot *>(val);
-    if (slot->Magic1 == kBridgeMagic1 && slot->Magic2 == kBridgeMagic2 &&
-        slot->Pid == pid && slot->Self == slot && slot->TlsIndex == idx &&
-        slot != &g_BridgeSlot) {
-      InterlockedExchangePointer(
-          &slot->NativeDispatch,
-          const_cast<NativeDispatchTable *>(&g_LocalDispatch));
-      slot->TlsIndex = TLS_OUT_OF_INDEXES;
+    if (TryClaimBridgeSlot(val, pid, idx)) {
       TlsSetValue(idx, nullptr);
       TlsFree(idx);
       break;
@@ -700,7 +731,7 @@ void ConnectPeerPeloaderInstance() {
 } // namespace dxcb5_proxy
 
 extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason,
-                               LPVOID /*reserved*/) {
+                               LPVOID reserved) {
   if (reason == DLL_PROCESS_ATTACH) {
     DisableThreadLibraryCalls(hInst);
     // UnityShaderCompiler.exe's custom in-memory PE loader stubs
@@ -728,6 +759,9 @@ extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason,
       dxcb5_proxy::g_BridgeSlot.TlsIndex = TLS_OUT_OF_INDEXES;
       TlsSetValue(idx, nullptr);
       TlsFree(idx);
+    } else if (dxcb5_proxy::g_IsNativeInstance && reserved == nullptr) {
+      dxcb5_proxy::SafeDisconnectPeerSlot(dxcb5_proxy::g_ConnectedPeerSlot);
+      dxcb5_proxy::g_ConnectedPeerSlot = nullptr;
     }
   }
   return TRUE;
@@ -743,6 +777,8 @@ extern "C" HRESULT WINAPI D3DCompile(
                          pEntrypoint, pTarget, Flags1, Flags2, ppCode,
                          ppErrorMsgs);
   }
+  if (!dxcb5_proxy::IsNativeInstance())
+    return E_FAIL;
   return dxcb5_proxy::D3DCompile_Native(
       pSrcData, SrcDataSize, pSourceName, pDefines, pInclude, pEntrypoint,
       pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
@@ -760,6 +796,8 @@ extern "C" HRESULT WINAPI D3DCompile2(
                           SecondaryDataFlags, pSecondaryData, SecondaryDataSize,
                           ppCode, ppErrorMsgs);
   }
+  if (!dxcb5_proxy::IsNativeInstance())
+    return E_FAIL;
   return dxcb5_proxy::D3DCompile2_Native(
       pSrcData, SrcDataSize, pSourceName, pDefines, pInclude, pEntrypoint,
       pTarget, Flags1, Flags2, SecondaryDataFlags, pSecondaryData,

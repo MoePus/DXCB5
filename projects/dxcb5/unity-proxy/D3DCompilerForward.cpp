@@ -27,6 +27,8 @@ template <typename Fn> Fn ResolveFxc(const char *name) {
   extern "C" HRESULT WINAPI name params {                                      \
     if (const auto *peerDisp = dxcb5_proxy::GetPeerNativeDispatch())           \
       return peerDisp->name args;                                              \
+    if (!dxcb5_proxy::IsNativeInstance())                                      \
+      return E_FAIL;                                                           \
     return dxcb5_proxy::name##_Native args;                                    \
   }
 
@@ -45,10 +47,12 @@ void WINAPI DebugSetMute_Native() {
 } // namespace dxcb5_proxy
 
 extern "C" void WINAPI DebugSetMute() {
-  if (const auto *d = dxcb5_proxy::GetPeerNativeDispatch()) {
-    d->DebugSetMute();
+  if (const auto *peerDisp = dxcb5_proxy::GetPeerNativeDispatch()) {
+    peerDisp->DebugSetMute();
     return;
   }
+  if (!dxcb5_proxy::IsNativeInstance())
+    return;
   dxcb5_proxy::DebugSetMute_Native();
 }
 

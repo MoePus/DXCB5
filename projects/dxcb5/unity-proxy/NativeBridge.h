@@ -77,10 +77,13 @@ struct PeloaderBridgeSlot {
 };
 
 extern PeloaderBridgeSlot g_BridgeSlot;
+extern bool g_IsNativeInstance;
 
 inline const NativeDispatchTable *GetPeerNativeDispatch() {
   return static_cast<const NativeDispatchTable *>(g_BridgeSlot.NativeDispatch);
 }
+
+inline bool IsNativeInstance() { return g_IsNativeInstance; }
 
 HMODULE GetFxcModule();
 void LogForwardFailure(const char *name);
