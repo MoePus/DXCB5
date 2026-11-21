@@ -39,7 +39,7 @@ dxcb5.exe -T ps_5_0 -E PSMain --vs-dxbc vs.dxbc --nan-safe -Fo ps.dxbc shader.hl
 powershell -ExecutionPolicy Bypass -File projects/dxcb5/unity-vcc/package_vcc.ps1 -BuildDir build -OutDir dist-vcc
 ```
 
-Install the generated `com.moepus.dxcb5-*.zip` via VRChat Creator Companion (VCC) or UPM, then open **`Tools -> DXCB5 Shader Compiler`** in Unity.
+Install via VRChat Creator Companion (VCC) from **[https://moepus.github.io/vpm/](https://moepus.github.io/vpm/)** (`https://moepus.github.io/vpm/index.json`), or install the generated `com.moepus.dxcb5-*.zip` via UPM, then open **`Tools -> DXCB5 Shader Compiler`** in Unity.
 
 ## Current Scope & Limits
 

@@ -7,7 +7,7 @@
   "description": "Drop-in SM5.0 DXBC compiler (DXCB5) for Unity 2022.3 D3D11 shader compilation via a safe D3DCompiler_47.dll proxy with automatic FXC fallback.",
   "author": {
     "name": "MoePus",
-    "url": "https://github.com/MoePus/dxcb5"
+    "url": "https://github.com/MoePus/DXCB5"
   },
   "license": "NCSA",
   "keywords": [

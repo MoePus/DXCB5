@@ -100,7 +100,7 @@ namespace MoePus.Dxcb5.Editor
 
         public static string GetUnityToolsDir()
         {
-            return Path.Combine(EditorApplication.applicationContentsPath, "Tools");
+            return Path.GetFullPath(Path.Combine(EditorApplication.applicationContentsPath, "Tools"));
         }
 
         public static string GetConfigDir()
