@@ -6,6 +6,7 @@
 #include <d3d11.h>
 #include <d3d11shader.h>
 #include <d3dcompiler.h>
+#include "../unity-proxy/NativeBridge.h"
 #include <wrl/client.h>
 #include <cstdio>
 #include <cstring>
@@ -96,8 +97,32 @@ int main(int argc, char **argv) {
     CopyOrFail(fxcSrc, stageDir + L"\\D3DCompiler_47_fxc.dll");
     CopyOrFail(dxcSrc, stageDir + L"\\dxcb5_dxcompiler.dll");
 
+    // Simulate UnityShaderCompiler.exe's custom in-memory PE loader copy
+    // publishing a PeloaderBridgeSlot in TLS immediately before the native
+    // LoadLibraryExW("Tools/D3DCompiler_47.dll") call on the same thread.
+    dxcb5_proxy::PeloaderBridgeSlot peerSlot{};
+    const DWORD peerTls = TlsAlloc();
+    Require(peerTls != TLS_OUT_OF_INDEXES, "TlsAlloc failed for bridge test");
+    peerSlot.Magic1 = dxcb5_proxy::kBridgeMagic1;
+    peerSlot.Magic2 = dxcb5_proxy::kBridgeMagic2;
+    peerSlot.Pid = GetCurrentProcessId();
+    peerSlot.TlsIndex = peerTls;
+    peerSlot.Self = &peerSlot;
+    peerSlot.NativeDispatch = nullptr;
+    Require(TlsSetValue(peerTls, &peerSlot) != 0, "TlsSetValue failed");
+
     HMODULE proxy = LoadLibraryW(stagedProxy.c_str());
     Require(proxy != nullptr, "Failed to load staged proxy D3DCompiler_47.dll");
+    Require(peerSlot.NativeDispatch != nullptr,
+            "Native DllMain failed to connect peer PeloaderBridgeSlot");
+    Require(peerSlot.TlsIndex == TLS_OUT_OF_INDEXES,
+            "Native DllMain failed to clear/free peer bridge TLS slot");
+    const auto *peerDisp =
+        static_cast<const dxcb5_proxy::NativeDispatchTable *>(
+            peerSlot.NativeDispatch);
+    Require(peerDisp->D3DCompile && peerDisp->D3DPreprocess &&
+                peerDisp->D3DReflect,
+            "Peer NativeDispatchTable missing required entries");
 
     auto fnCompile = reinterpret_cast<PFN_D3DCompile>(
         GetProcAddress(proxy, "D3DCompile"));
@@ -322,6 +347,45 @@ int main(int argc, char **argv) {
     Require(log4.size() == log3.size(),
             "Expected automatic FXC bypass after com.moepus.dxcb5 is removed");
     SetEnvironmentVariableW(L"DXCB5_UNITY_PROJECT_DIR", nullptr);
+
+    // 7. Peer NativeDispatchTable (peloader bridge) compile + preprocess.
+    {
+      ComPtr<ID3DBlob> bridgeBlob, preBlob;
+      Require(SUCCEEDED(peerDisp->D3DPreprocess(
+                  kDx11Src, std::strlen(kDx11Src), "dx11.hlsl", nullptr,
+                  nullptr, &preBlob, &errBlob)),
+              "Peer NativeDispatchTable D3DPreprocess failed");
+      Require(SUCCEEDED(peerDisp->D3DCompile(
+                  kDx11Src, std::strlen(kDx11Src), "dx11.hlsl", nullptr,
+                  nullptr, "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                  0, &bridgeBlob, &errBlob)),
+              "Peer NativeDispatchTable D3DCompile failed");
+    }
+
+    // 8. stats.log rotation to stats.log.1 once size exceeds 512 KB.
+    {
+      const std::wstring statsPath = cfgDir + L"\\stats.log";
+      const std::wstring prevPath = cfgDir + L"\\stats.log.1";
+      DeleteFileW(prevPath.c_str());
+      {
+        std::ofstream f(statsPath, std::ios::binary | std::ios::trunc);
+        std::string pad(520 * 1024, 'x');
+        f.write(pad.data(), static_cast<std::streamsize>(pad.size()));
+      }
+      ComPtr<ID3DBlob> rotBlob;
+      Require(SUCCEEDED(fnCompile(kDx11Src, std::strlen(kDx11Src), "dx11.hlsl",
+                                  nullptr, nullptr, "PSMain", "ps_5_0",
+                                  D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &rotBlob,
+                                  &errBlob)),
+              "Rotation trigger compile failed");
+      const std::string rotatedPrev = ReadFileText(prevPath);
+      const std::string rotatedCurr = ReadFileText(statsPath);
+      Require(rotatedPrev.size() >= 520 * 1024,
+              "Expected stats.log.1 to hold previous log after rotation");
+      Require(rotatedCurr.size() < 4096 &&
+                  rotatedCurr.find("HIT\tps_5_0\tPSMain") != std::string::npos,
+              "Expected fresh stats.log with new HIT after rotation");
+    }
 
     // Optional real Unity preprocessed HLSL file check (argv[5..]).
     SetEnvironmentVariableW(L"DXCB5_UNITY_ENABLE", L"1");

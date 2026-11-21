@@ -1,9 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <d3dcompiler.h>
+#include "NativeBridge.h"
 #include <wrl/client.h>
 #include "UnityHlslAdapter.h"
 #include "dxc/dxcapi.h"
@@ -12,7 +8,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <string>
 #include <vector>
 
@@ -167,27 +162,44 @@ bool ShouldActivateForCurrentProject(const ProxyConfig &cfg) {
   return !IsUnityShaderCompilerProcess();
 }
 
+std::wstring Utf8ToWide(const char *s);
+std::string WideToUtf8(const wchar_t *s);
+
+SRWLOCK g_LogLock = SRWLOCK_INIT;
+
 void AppendLogLine(const std::string &line) {
-  static std::mutex logMutex;
-  std::lock_guard<std::mutex> lock(logMutex);
+  AcquireSRWLockExclusive(&g_LogLock);
   const std::wstring dir = GetConfigDir();
   CreateDirectoryW(dir.c_str(), nullptr);
   const std::wstring logPath = dir + L"\\stats.log";
-  // Cap log file around 512 KB so it never grows unbounded.
+  // Rotate stats.log -> stats.log.1 around 512 KB so it never grows unbounded.
   WIN32_FILE_ATTRIBUTE_DATA fad{};
   if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad) &&
       fad.nFileSizeLow > 512 * 1024) {
-    DeleteFileW(logPath.c_str());
+    const std::wstring prevPath = dir + L"\\stats.log.1";
+    MoveFileExW(logPath.c_str(), prevPath.c_str(), MOVEFILE_REPLACE_EXISTING);
   }
-  HANDLE h = CreateFileW(logPath.c_str(), FILE_APPEND_DATA,
-                         FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                         OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE h = CreateFileW(
+      logPath.c_str(), FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (h != INVALID_HANDLE_VALUE) {
     DWORD written = 0;
     WriteFile(h, line.data(), static_cast<DWORD>(line.size()), &written,
               nullptr);
     CloseHandle(h);
   }
+  ReleaseSRWLockExclusive(&g_LogLock);
+}
+
+bool IsTraceEnabled() {
+  wchar_t buf[8] = {};
+  return GetEnvironmentVariableW(L"DXCB5_UNITY_TRACE", buf, 8) > 0 &&
+         buf[0] != L'0';
+}
+
+void AppendDiagLine(const std::string &line) {
+  AppendLogLine(line);
 }
 
 struct LoadedLibraries {
@@ -201,7 +213,13 @@ struct LoadedLibraries {
   LoadedLibraries() {
     const std::wstring dir = GetModuleDirectory();
     const std::wstring fxcPath = dir + L"\\D3DCompiler_47_fxc.dll";
-    FxcMod = LoadLibraryW(fxcPath.c_str());
+    FxcMod = LoadLibraryExW(fxcPath.c_str(), nullptr,
+                            LOAD_WITH_ALTERED_SEARCH_PATH);
+    DWORD fxcErr = FxcMod ? 0 : GetLastError();
+    if (!FxcMod) {
+      FxcMod = LoadLibraryW(fxcPath.c_str());
+      fxcErr = FxcMod ? 0 : GetLastError();
+    }
     if (FxcMod) {
       FxcCompile = reinterpret_cast<PFN_D3DCompile>(
           GetProcAddress(FxcMod, "D3DCompile"));
@@ -211,10 +229,29 @@ struct LoadedLibraries {
           GetProcAddress(FxcMod, "D3DCreateBlob"));
     }
     const std::wstring dxcPath = dir + L"\\dxcb5_dxcompiler.dll";
-    DxcMod = LoadLibraryW(dxcPath.c_str());
+    DxcMod = LoadLibraryExW(dxcPath.c_str(), nullptr,
+                            LOAD_WITH_ALTERED_SEARCH_PATH);
+    DWORD dxcErr = DxcMod ? 0 : GetLastError();
+    if (!DxcMod) {
+      DxcMod = LoadLibraryW(dxcPath.c_str());
+      dxcErr = DxcMod ? 0 : GetLastError();
+    }
     if (DxcMod) {
       DxcCreateInstanceFn = reinterpret_cast<PFN_DxcCreateInstance>(
           GetProcAddress(DxcMod, "DxcCreateInstance"));
+    }
+    if (!FxcMod || !FxcCompile || !DxcMod || !DxcCreateInstanceFn ||
+        IsTraceEnabled()) {
+      char msg[1024];
+      std::snprintf(
+          msg, sizeof(msg),
+          "DIAG\tinit\tdir=%s\tfxc=%p(err=%lu,fn=%p)\tdxc=%p(err=%lu,fn=%p)\n",
+          WideToUtf8(dir.c_str()).c_str(), static_cast<void *>(FxcMod),
+          static_cast<unsigned long>(fxcErr),
+          reinterpret_cast<void *>(FxcCompile), static_cast<void *>(DxcMod),
+          static_cast<unsigned long>(dxcErr),
+          reinterpret_cast<void *>(DxcCreateInstanceFn));
+      AppendDiagLine(msg);
     }
   }
 };
@@ -228,6 +265,11 @@ LoadedLibraries &GetLibs() {
 
 namespace dxcb5_proxy {
 HMODULE GetFxcModule() { return GetLibs().FxcMod; }
+void LogForwardFailure(const char *name) {
+  char line[160];
+  std::snprintf(line, sizeof(line), "DIAG\tforward_null\t%s\n", name);
+  AppendDiagLine(line);
+}
 } // namespace dxcb5_proxy
 
 namespace {
@@ -472,26 +514,57 @@ bool TryCompileWithDxcb5(LPCVOID pSrcData, SIZE_T SrcDataSize,
 
 } // namespace
 
-extern "C" HRESULT WINAPI D3DCompile(
+namespace dxcb5_proxy {
+
+PeloaderBridgeSlot g_BridgeSlot = {0, 0, 0, TLS_OUT_OF_INDEXES, nullptr,
+                                   nullptr};
+
+HRESULT WINAPI D3DCompile_Native(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO *pDefines, ID3DInclude *pInclude, LPCSTR pEntrypoint,
     LPCSTR pTarget, UINT Flags1, UINT Flags2, ID3DBlob **ppCode,
     ID3DBlob **ppErrorMsgs) {
   auto &libs = GetLibs();
-  if (!libs.FxcCompile)
+  if (!libs.FxcCompile) {
+    AppendDiagLine("DIAG\tD3DCompile\tFxcCompile is null -> E_FAIL\n");
     return E_FAIL;
+  }
+  const bool trace = IsTraceEnabled();
   const bool supportedTarget =
       EqualsIgnoreCase(pTarget, "vs_5_0") || EqualsIgnoreCase(pTarget, "ps_5_0");
   if (!supportedTarget || !pSrcData || !SrcDataSize || !ppCode) {
-    return libs.FxcCompile(pSrcData, SrcDataSize, pSourceName, pDefines,
-                           pInclude, pEntrypoint, pTarget, Flags1, Flags2,
-                           ppCode, ppErrorMsgs);
+    const HRESULT hr = libs.FxcCompile(pSrcData, SrcDataSize, pSourceName,
+                                       pDefines, pInclude, pEntrypoint, pTarget,
+                                       Flags1, Flags2, ppCode, ppErrorMsgs);
+    if (trace) {
+      char line[256];
+      std::snprintf(line, sizeof(line),
+                    "TRACE\tD3DCompile_pass\t%s\t%s\thr=0x%08lx\n",
+                    pTarget ? pTarget : "", pEntrypoint ? pEntrypoint : "",
+                    static_cast<unsigned long>(hr));
+      AppendDiagLine(line);
+    }
+    return hr;
   }
   const ProxyConfig cfg = LoadConfig();
-  if (!cfg.Enabled || !ShouldActivateForCurrentProject(cfg)) {
-    return libs.FxcCompile(pSrcData, SrcDataSize, pSourceName, pDefines,
-                           pInclude, pEntrypoint, pTarget, Flags1, Flags2,
-                           ppCode, ppErrorMsgs);
+  const bool active = cfg.Enabled && ShouldActivateForCurrentProject(cfg);
+  if (!active) {
+    const HRESULT hr = libs.FxcCompile(pSrcData, SrcDataSize, pSourceName,
+                                       pDefines, pInclude, pEntrypoint, pTarget,
+                                       Flags1, Flags2, ppCode, ppErrorMsgs);
+    if (trace) {
+      wchar_t cwd[512] = {};
+      GetCurrentDirectoryW(512, cwd);
+      char line[512];
+      std::snprintf(
+          line, sizeof(line),
+          "TRACE\tD3DCompile_bypass\t%s\t%s\ten=%d\treq=%d\tcwd=%s\thr=0x%08lx\n",
+          pTarget ? pTarget : "", pEntrypoint ? pEntrypoint : "",
+          cfg.Enabled ? 1 : 0, cfg.RequirePackage ? 1 : 0,
+          WideToUtf8(cwd).c_str(), static_cast<unsigned long>(hr));
+      AppendDiagLine(line);
+    }
+    return hr;
   }
 
   const auto t0 = std::chrono::steady_clock::now();
@@ -529,16 +602,16 @@ extern "C" HRESULT WINAPI D3DCompile(
                          ppErrorMsgs);
 }
 
-extern "C" HRESULT WINAPI D3DCompile2(
+HRESULT WINAPI D3DCompile2_Native(
     LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
     const D3D_SHADER_MACRO *pDefines, ID3DInclude *pInclude, LPCSTR pEntrypoint,
     LPCSTR pTarget, UINT Flags1, UINT Flags2, UINT SecondaryDataFlags,
     LPCVOID pSecondaryData, SIZE_T SecondaryDataSize, ID3DBlob **ppCode,
     ID3DBlob **ppErrorMsgs) {
   if (!SecondaryDataFlags && !pSecondaryData && !SecondaryDataSize) {
-    return D3DCompile(pSrcData, SrcDataSize, pSourceName, pDefines, pInclude,
-                      pEntrypoint, pTarget, Flags1, Flags2, ppCode,
-                      ppErrorMsgs);
+    return D3DCompile_Native(pSrcData, SrcDataSize, pSourceName, pDefines,
+                             pInclude, pEntrypoint, pTarget, Flags1, Flags2,
+                             ppCode, ppErrorMsgs);
   }
   auto &libs = GetLibs();
   if (!libs.FxcCompile2)
@@ -547,4 +620,148 @@ extern "C" HRESULT WINAPI D3DCompile2(
                           pInclude, pEntrypoint, pTarget, Flags1, Flags2,
                           SecondaryDataFlags, pSecondaryData, SecondaryDataSize,
                           ppCode, ppErrorMsgs);
+}
+
+namespace {
+
+const NativeDispatchTable g_LocalDispatch = {
+    &D3DCompile_Native,
+    &D3DCompile2_Native,
+    &D3DAssemble_Native,
+    &DebugSetMute_Native,
+    &D3DCompileFromFile_Native,
+    &D3DCompressShaders_Native,
+    &D3DCreateBlob_Native,
+    &D3DCreateFunctionLinkingGraph_Native,
+    &D3DCreateLinker_Native,
+    &D3DDecompressShaders_Native,
+    &D3DDisassemble_Native,
+    &D3DDisassemble10Effect_Native,
+    &D3DDisassemble11Trace_Native,
+    &D3DDisassembleRegion_Native,
+    &D3DGetBlobPart_Native,
+    &D3DGetDebugInfo_Native,
+    &D3DGetInputAndOutputSignatureBlob_Native,
+    &D3DGetInputSignatureBlob_Native,
+    &D3DGetOutputSignatureBlob_Native,
+    &D3DGetTraceInstructionOffsets_Native,
+    &D3DLoadModule_Native,
+    &D3DPreprocess_Native,
+    &D3DReadFileToBlob_Native,
+    &D3DReflect_Native,
+    &D3DReflectLibrary_Native,
+    &D3DReturnFailure1_Native,
+    &D3DSetBlobPart_Native,
+    &D3DStripShader_Native,
+    &D3DWriteBlobToFile_Native,
+};
+
+bool g_IsNativeInstance = false;
+
+void ConnectPeerPeloaderInstance() {
+  const DWORD savedErr = GetLastError();
+  const DWORD pid = GetCurrentProcessId();
+  // Windows supports up to 1088 TLS slots (64 primary + 1024 expansion).
+  for (DWORD idx = 0; idx < 1088; ++idx) {
+    void *val = TlsGetValue(idx);
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(val);
+    if (!val || (addr & 7) != 0 || addr < 0x10000)
+      continue;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(val, &mbi, sizeof(mbi)))
+      continue;
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & PAGE_GUARD))
+      continue;
+    const DWORD prot = mbi.Protect & 0xFF;
+    if (prot != PAGE_READWRITE && prot != PAGE_EXECUTE_READWRITE)
+      continue;
+    const uintptr_t regionEnd =
+        reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    if (addr + sizeof(PeloaderBridgeSlot) > regionEnd)
+      continue;
+    auto *slot = static_cast<PeloaderBridgeSlot *>(val);
+    if (slot->Magic1 == kBridgeMagic1 && slot->Magic2 == kBridgeMagic2 &&
+        slot->Pid == pid && slot->Self == slot && slot->TlsIndex == idx &&
+        slot != &g_BridgeSlot) {
+      InterlockedExchangePointer(
+          &slot->NativeDispatch,
+          const_cast<NativeDispatchTable *>(&g_LocalDispatch));
+      slot->TlsIndex = TLS_OUT_OF_INDEXES;
+      TlsSetValue(idx, nullptr);
+      TlsFree(idx);
+      break;
+    }
+  }
+  SetLastError(savedErr);
+}
+
+} // namespace
+
+} // namespace dxcb5_proxy
+
+extern "C" BOOL WINAPI DllMain(HINSTANCE hInst, DWORD reason,
+                               LPVOID /*reserved*/) {
+  if (reason == DLL_PROCESS_ATTACH) {
+    DisableThreadLibraryCalls(hInst);
+    // UnityShaderCompiler.exe's custom in-memory PE loader stubs
+    // GetModuleHandleA to return nullptr, whereas Windows LoadLibraryExW
+    // resolves the real KERNEL32!GetModuleHandleA which returns the host EXE.
+    dxcb5_proxy::g_IsNativeInstance = (GetModuleHandleA(nullptr) != nullptr);
+    if (!dxcb5_proxy::g_IsNativeInstance) {
+      const DWORD idx = TlsAlloc();
+      if (idx != TLS_OUT_OF_INDEXES) {
+        dxcb5_proxy::g_BridgeSlot.Magic1 = dxcb5_proxy::kBridgeMagic1;
+        dxcb5_proxy::g_BridgeSlot.Magic2 = dxcb5_proxy::kBridgeMagic2;
+        dxcb5_proxy::g_BridgeSlot.Pid = GetCurrentProcessId();
+        dxcb5_proxy::g_BridgeSlot.TlsIndex = idx;
+        dxcb5_proxy::g_BridgeSlot.Self = &dxcb5_proxy::g_BridgeSlot;
+        dxcb5_proxy::g_BridgeSlot.NativeDispatch = nullptr;
+        TlsSetValue(idx, &dxcb5_proxy::g_BridgeSlot);
+      }
+    } else {
+      dxcb5_proxy::ConnectPeerPeloaderInstance();
+    }
+  } else if (reason == DLL_PROCESS_DETACH) {
+    if (!dxcb5_proxy::g_IsNativeInstance &&
+        dxcb5_proxy::g_BridgeSlot.TlsIndex != TLS_OUT_OF_INDEXES) {
+      const DWORD idx = dxcb5_proxy::g_BridgeSlot.TlsIndex;
+      dxcb5_proxy::g_BridgeSlot.TlsIndex = TLS_OUT_OF_INDEXES;
+      TlsSetValue(idx, nullptr);
+      TlsFree(idx);
+    }
+  }
+  return TRUE;
+}
+
+extern "C" HRESULT WINAPI D3DCompile(
+    LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
+    const D3D_SHADER_MACRO *pDefines, ID3DInclude *pInclude, LPCSTR pEntrypoint,
+    LPCSTR pTarget, UINT Flags1, UINT Flags2, ID3DBlob **ppCode,
+    ID3DBlob **ppErrorMsgs) {
+  if (const auto *d = dxcb5_proxy::GetPeerNativeDispatch()) {
+    return d->D3DCompile(pSrcData, SrcDataSize, pSourceName, pDefines, pInclude,
+                         pEntrypoint, pTarget, Flags1, Flags2, ppCode,
+                         ppErrorMsgs);
+  }
+  return dxcb5_proxy::D3DCompile_Native(
+      pSrcData, SrcDataSize, pSourceName, pDefines, pInclude, pEntrypoint,
+      pTarget, Flags1, Flags2, ppCode, ppErrorMsgs);
+}
+
+extern "C" HRESULT WINAPI D3DCompile2(
+    LPCVOID pSrcData, SIZE_T SrcDataSize, LPCSTR pSourceName,
+    const D3D_SHADER_MACRO *pDefines, ID3DInclude *pInclude, LPCSTR pEntrypoint,
+    LPCSTR pTarget, UINT Flags1, UINT Flags2, UINT SecondaryDataFlags,
+    LPCVOID pSecondaryData, SIZE_T SecondaryDataSize, ID3DBlob **ppCode,
+    ID3DBlob **ppErrorMsgs) {
+  if (const auto *d = dxcb5_proxy::GetPeerNativeDispatch()) {
+    return d->D3DCompile2(pSrcData, SrcDataSize, pSourceName, pDefines,
+                          pInclude, pEntrypoint, pTarget, Flags1, Flags2,
+                          SecondaryDataFlags, pSecondaryData, SecondaryDataSize,
+                          ppCode, ppErrorMsgs);
+  }
+  return dxcb5_proxy::D3DCompile2_Native(
+      pSrcData, SrcDataSize, pSourceName, pDefines, pInclude, pEntrypoint,
+      pTarget, Flags1, Flags2, SecondaryDataFlags, pSecondaryData,
+      SecondaryDataSize, ppCode, ppErrorMsgs);
 }

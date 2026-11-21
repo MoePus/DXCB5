@@ -1,13 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <d3dcompiler.h>
-
-namespace dxcb5_proxy {
-HMODULE GetFxcModule();
-} // namespace dxcb5_proxy
+#include "NativeBridge.h"
 
 namespace {
 
@@ -21,10 +13,21 @@ template <typename Fn> Fn ResolveFxc(const char *name) {
 } // namespace
 
 #define FWD_HR(name, params, args)                                             \
-  extern "C" HRESULT WINAPI name params {                                      \
+  namespace dxcb5_proxy {                                                      \
+  HRESULT WINAPI name##_Native params {                                        \
     using Pfn = HRESULT(WINAPI *) params;                                      \
     static Pfn fn = ResolveFxc<Pfn>(#name);                                    \
-    return fn ? fn args : E_FAIL;                                              \
+    if (!fn) {                                                                 \
+      dxcb5_proxy::LogForwardFailure(#name);                                   \
+      return E_FAIL;                                                           \
+    }                                                                          \
+    return fn args;                                                            \
+  }                                                                            \
+  }                                                                            \
+  extern "C" HRESULT WINAPI name params {                                      \
+    if (const auto *peerDisp = dxcb5_proxy::GetPeerNativeDispatch())           \
+      return peerDisp->name args;                                              \
+    return dxcb5_proxy::name##_Native args;                                    \
   }
 
 FWD_HR(D3DAssemble,
@@ -32,11 +35,21 @@ FWD_HR(D3DAssemble,
         ID3DInclude *e, UINT f, ID3DBlob **g, ID3DBlob **h),
        (a, b, c, d, e, f, g, h))
 
-extern "C" void WINAPI DebugSetMute() {
+namespace dxcb5_proxy {
+void WINAPI DebugSetMute_Native() {
   using Pfn = void(WINAPI *)();
   static Pfn fn = ResolveFxc<Pfn>("DebugSetMute");
   if (fn)
     fn();
+}
+} // namespace dxcb5_proxy
+
+extern "C" void WINAPI DebugSetMute() {
+  if (const auto *d = dxcb5_proxy::GetPeerNativeDispatch()) {
+    d->DebugSetMute();
+    return;
+  }
+  dxcb5_proxy::DebugSetMute_Native();
 }
 
 FWD_HR(D3DCompileFromFile,
