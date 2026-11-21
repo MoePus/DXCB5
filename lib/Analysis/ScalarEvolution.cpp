@@ -5411,12 +5411,15 @@ getConstantEvolvingPHIOperands(Instruction *UseInst, const Loop *L,
 
     if (isa<Constant>(*OpI)) continue;
 
-    // HLSL Change begin
-    if (DVC->GetConstValue(*OpI)) continue;
-    // HLSL Change end
-
     Instruction *OpInst = dyn_cast<Instruction>(*OpI);
-    if (!OpInst || !canConstantEvolve(OpInst, L)) return nullptr;
+    if (!OpInst || !canConstantEvolve(OpInst, L)) {
+      // HLSL Change begin: Only query DxilValueCache when the operand cannot
+      // evolve inside L (e.g. loop-invariant expressions), avoiding full-CFG
+      // DVC walks over loop-header induction PHIs.
+      if (DVC->GetConstValue(*OpI)) continue;
+      // HLSL Change end
+      return nullptr;
+    }
 
     PHINode *P = dyn_cast<PHINode>(OpInst);
     if (!P)
@@ -5431,8 +5434,13 @@ getConstantEvolvingPHIOperands(Instruction *UseInst, const Loop *L,
       P = getConstantEvolvingPHIOperands(OpInst, L, DVC, PHIMap); // HLSL Change - Pass DVC
       PHIMap[OpInst] = P;
     }
-    if (!P)
+    if (!P) {
+      // HLSL Change begin: Fall back to DVC if OpInst did not evolve from a
+      // loop PHI (e.g. a loop-internal expression of constant operands).
+      if (DVC->GetConstValue(OpInst)) continue;
+      // HLSL Change end
       return nullptr;  // Not evolving from PHI
+    }
     if (PHI && PHI != P)
       return nullptr;  // Evolving from multiple different PHIs.
     PHI = P;
@@ -5680,22 +5688,25 @@ const SCEV *ScalarEvolution::ComputeExitCountExhaustively(const Loop *L,
   // HLSL Change begin
   SmallVector<std::pair<Instruction *, Constant *>, 4> KnownInvariantOps;
   if (Instruction *CondI = dyn_cast<Instruction>(Cond)) {
-    SmallVector<Instruction *, 4> Worklist;
+    SmallVector<Instruction *, 8> Worklist;
+    SmallPtrSet<Instruction *, 16> Visited;
 
     Worklist.push_back(CondI);
     while (Worklist.size()) {
       Instruction *I = Worklist.pop_back_val();
-
-      if (Constant *C = DVC.GetConstValue(I)) {
-        KnownInvariantOps.push_back({ I, C });
-      } else if (CurrentIterVals.count(I)) {
+      if (!Visited.insert(I).second)
         continue;
-      } else if (L->contains(I)) {
+
+      if (CurrentIterVals.count(I)) {
+        continue;
+      } else if (canConstantEvolve(I, L)) {
         for (Use &U : I->operands()) {
           if (Instruction *OpI = dyn_cast<Instruction>(U.get())) {
             Worklist.push_back(OpI);
           }
         }
+      } else if (Constant *C = DVC.GetConstValue(I)) {
+        KnownInvariantOps.push_back({ I, C });
       }
     }
   }

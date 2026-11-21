@@ -79,9 +79,20 @@ float4 EvalGroup(uint group) {
   return ReadPanel(group * 2u + 0u) + ReadPanel(group * 2u + 1u);
 }
 void MutateInOut(inout uint idx, uint delta) { idx = idx + delta; }
+float4 UnrollEarlyExit(float4 base, int count, int start) {
+  float4 acc = base;
+  [unroll] for (int i = start; i < 2; ++i) {
+    if (i >= count) break;
+    acc += Table[i] * (float)(i + 1);
+  }
+  return acc;
+}
 float4 shade(float4 color : COLOR0) : SV_Target0 {
   // Constant-arg multi-level switch pruning: all switches fold during inlining.
   float4 sum = EvalGroup(0u) + EvalGroup(1u) + EvalGroup(2u) + EvalGroup(3u);
+  // SCEV exhaustive exit-count with early exit + float loop-carried PHI.
+  int lim = (int)color.y;
+  sum += UnrollEarlyExit(color, lim, 0);
   // Multi-store / inout safety: must NOT fold away dynamic mutation.
   uint dyn = 1u;
   MutateInOut(dyn, (uint)color.x);

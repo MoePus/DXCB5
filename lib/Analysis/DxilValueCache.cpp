@@ -579,6 +579,8 @@ Value *DxilValueCache::ProcessValue(Value *NewV, DominatorTree *DT) {
     if (!Map.Seen(V)) {
       Map.SetSentinel(V);
       if (Instruction *I = dyn_cast<Instruction>(V)) {
+        if (ShouldSkipCallback && ShouldSkipCallback(I))
+          continue;
 
         for (Use &U : I->operands()) {
           Instruction *UseI = dyn_cast<Instruction>(U.get());
