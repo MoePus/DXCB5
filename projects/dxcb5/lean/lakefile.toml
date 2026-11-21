@@ -1,0 +1,5 @@
+name = "Dxcb5Proofs"
+defaultTargets = ["ParallelCopy"]
+
+[[lean_lib]]
+name = "ParallelCopy"

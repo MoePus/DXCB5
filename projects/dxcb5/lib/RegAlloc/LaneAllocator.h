@@ -1,0 +1,28 @@
+// Distributed under the University of Illinois Open Source License.
+#ifndef DXCB5_REGALLOC_LANE_ALLOCATOR_H
+#define DXCB5_REGALLOC_LANE_ALLOCATOR_H
+
+#include "RegAlloc/Liveness.h"
+#include "dxcb5/ControlFlow.h"
+#include "llvm/ADT/ArrayRef.h"
+#include <array>
+#include <cstdint>
+#include <vector>
+
+namespace dxcb5 {
+
+struct LaneAllocation {
+  uint32_t PhysReg = UINT32_MAX;
+  std::array<uint8_t, 4> LaneMap = {0, 1, 2, 3};
+  uint8_t PhysMask = 0;
+};
+
+// Allocates virtual registers to physical (PhysReg, LaneMap) sub-register slots
+// with cross-lane weighted affinity coalescing and tight sub-register packing.
+bool AllocateLaneRegisters(llvm::ArrayRef<FlowBlock> Blocks,
+                           const LivenessResult &Live,
+                           std::vector<LaneAllocation> &Allocation,
+                           uint32_t &PhysTempCount);
+
+} // namespace dxcb5
+#endif
