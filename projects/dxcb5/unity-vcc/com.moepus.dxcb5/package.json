@@ -1,0 +1,25 @@
+{
+  "name": "com.moepus.dxcb5",
+  "displayName": "DXCB5 Shader Compiler",
+  "version": "0.1.0",
+  "unity": "2022.3",
+  "unityRelease": "22f1",
+  "description": "Drop-in SM5.0 DXBC compiler (DXCB5) for Unity 2022.3 D3D11 shader compilation via a safe D3DCompiler_47.dll proxy with automatic FXC fallback.",
+  "author": {
+    "name": "MoePus",
+    "url": "https://github.com/MoePus/dxcb5"
+  },
+  "license": "NCSA",
+  "keywords": [
+    "shader",
+    "hlsl",
+    "dxbc",
+    "dxc",
+    "fxc",
+    "dxcb5",
+    "vrc",
+    "vrchat"
+  ],
+  "vpmDependencies": {},
+  "hideInEditor": false
+}

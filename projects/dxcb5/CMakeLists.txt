@@ -63,6 +63,27 @@ target_include_directories(dxcb5 PRIVATE "${LLVM_MAIN_SRC_DIR}/tools/clang/tools
 target_link_libraries(dxcb5 PRIVATE dxclib dxcompiler)
 install(TARGETS dxcb5 RUNTIME DESTINATION bin)
 
+add_library(DXCB5UnityProxy SHARED
+  unity-proxy/D3DCompilerProxy.cpp
+  unity-proxy/D3DCompilerForward.cpp
+  unity-proxy/UnityHlslAdapter.cpp
+  unity-proxy/D3DCompiler_47.def
+)
+target_include_directories(DXCB5UnityProxy PRIVATE "${LLVM_MAIN_SRC_DIR}/include")
+target_compile_options(DXCB5UnityProxy PRIVATE /EHsc)
+set_target_properties(DXCB5UnityProxy PROPERTIES
+  OUTPUT_NAME "D3DCompiler_47"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/unity-proxy"
+)
+add_executable(DXCB5UnityProxyTest tests/UnityProxyTest.cpp)
+target_compile_options(DXCB5UnityProxyTest PRIVATE /EHsc)
+target_link_libraries(DXCB5UnityProxyTest PRIVATE d3d11)
+add_test(NAME DXCB5UnityProxy COMMAND DXCB5UnityProxyTest
+  "$<TARGET_FILE:DXCB5UnityProxy>"
+  "$ENV{SystemRoot}/System32/D3DCompiler_47.dll"
+  "$<TARGET_FILE:dxcompiler>"
+  "${CMAKE_CURRENT_BINARY_DIR}/unity-proxy-test")
+
 add_executable(DXCB5ParallelCopyTest tests/ParallelCopyTest.cpp lib/ControlFlow/ParallelCopy.cpp)
 target_include_directories(DXCB5ParallelCopyTest PRIVATE include)
 enable_testing()

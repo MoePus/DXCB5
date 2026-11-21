@@ -2,7 +2,7 @@
 
 DXCB5 is an experimental fork of Microsoft's [DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler) that compiles HLSL directly to native **Shader Model 5.0 DXBC** (`vs_5_0` / `ps_5_0`) for Direct3D 11.
 
-It pairs DXC's modern HLSL frontend and LLVM middle-end with a dedicated Vector SSA MIR backend, lane-aware register allocator, structured control-flow emitter, and DXBC container writer (`RDEF`, `ISGN`, `OSGN`, `SHEX`, `SFI0`).
+It pairs DXC's modern HLSL frontend and LLVM middle-end with a dedicated Vector SSA MIR backend, lane-aware register allocator, structured control-flow emitter, and DXBC container writer (`RDEF`, `ISGN`, `OSGN`, `SHEX`, `STAT`, `SFI0`).
 
 ## Highlights
 
@@ -16,22 +16,30 @@ Requires Visual Studio (MSVC x64), CMake, Ninja, and Windows SDK (`d3d11`, `d3dc
 
 ```powershell
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -C cmake/caches/PredefinedParams.cmake
-cmake --build build --target dxcb5 DXCB5WarpABITest -j
+cmake --build build --target dxcb5 DXCB5UnityProxy DXCB5WarpABITest -j
 ctest --test-dir build/projects/dxcb5 --output-on-failure
 ```
 
 ## Usage
 
 ```powershell
-# Compile vertex shader to SM5.0 DXBC
+# Compile vertex or standalone pixel shader to SM5.0 DXBC
 dxcb5.exe -T vs_5_0 -E VSMain -Fo vs.dxbc shader.hlsl
+dxcb5.exe -T ps_5_0 -E PSMain -Fo ps.dxbc shader.hlsl
 
-# Compile pixel shader linked against a vertex shader's output signature
-dxcb5.exe -T ps_5_0 -E PSMain --vs-dxbc vs.dxbc -Fo ps.dxbc shader.hlsl
-
-# Optional: preserve strict NaN semantics in FP optimizations (auto-enabled on -Od / -Gis)
+# Optional: link PS input signature explicitly against a VS DXBC, or enforce strict NaN semantics
 dxcb5.exe -T ps_5_0 -E PSMain --vs-dxbc vs.dxbc --nan-safe -Fo ps.dxbc shader.hlsl
 ```
+
+## Unity 2022.3 / VCC Plugin
+
+`projects/dxcb5/unity-proxy/` builds a drop-in `D3DCompiler_47.dll` proxy for Unity `2022.3.22f1` (`Editor/Data/Tools/`) that routes `vs_5_0`/`ps_5_0` through `dxcb5_dxcompiler.dll` with automatic FXC fallback (`D3DCompiler_47_fxc.dll`).
+
+```powershell
+powershell -ExecutionPolicy Bypass -File projects/dxcb5/unity-vcc/package_vcc.ps1 -BuildDir build -OutDir dist-vcc
+```
+
+Install the generated `com.moepus.dxcb5-*.zip` via VRChat Creator Companion (VCC) or UPM, then open **`Tools -> DXCB5 Shader Compiler`** in Unity.
 
 ## Current Scope & Limits
 
