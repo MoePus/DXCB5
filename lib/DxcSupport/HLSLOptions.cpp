@@ -532,10 +532,6 @@ static bool ValidateDxcb5Options(const InputArgList &args,
     errors << "DXCB5 requires target profile vs_5_0 or ps_5_0.";
     return false;
   }
-  if (opts.TargetProfile == "ps_5_0" && opts.Dxcb5VertexBytecode.empty()) {
-    errors << "DXCB5 requires --vs-dxbc <file> for ps_5_0.";
-    return false;
-  }
   if (opts.TargetProfile == "vs_5_0" && args.hasArg(OPT_dxcb5_vs_dxbc)) {
     errors << "DXCB5 only accepts --vs-dxbc for ps_5_0.";
     return false;

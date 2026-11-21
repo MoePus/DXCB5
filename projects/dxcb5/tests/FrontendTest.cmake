@@ -34,7 +34,6 @@ endfunction()
 set(ENV{DXC_DXIL_DLL_PATH} "invalid-relative-validator.dll")
 expect_dxcb5_error("vs_5_0 or ps_5_0" -T cs_5_0 -Fo "${unused}")
 expect_dxcb5_error("requires -Fo" -T vs_5_0)
-expect_dxcb5_error("requires --vs-dxbc" -T ps_5_0 -Fo "${unused}")
 expect_dxcb5_error("only accepts --vs-dxbc"
   -T vs_5_0 -Fo "${unused}" --vs-dxbc "${vertex}")
 expect_dxcb5_error("does not support -Fc"
@@ -54,6 +53,9 @@ endfunction()
 
 compile_shader("${DXCB5}" vs_5_0 "${vertex}" "(53484452|53484558)"
   -D EXPECTED_MAJOR=5 -D EXPECT_VERTEX=1)
+compile_shader("${DXCB5}" ps_5_0 "${TEST_DIR}/pixel_standalone.dxbc"
+  "(53484452|53484558)" -D EXPECTED_MAJOR=5)
+verify_dxbc("${vertex}" "${TEST_DIR}/pixel_standalone.dxbc" "ps_5_0")
 compile_shader("${DXCB5}" ps_5_0 "${pixel}" "(53484452|53484558)"
   -D EXPECTED_MAJOR=5 --vs-dxbc "${vertex}")
 verify_dxbc("${vertex}" "${pixel}" "ps_5_0")

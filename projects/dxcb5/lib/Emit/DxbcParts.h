@@ -14,6 +14,7 @@ constexpr uint32_t FourCC(char a, char b, char c, char d) {
 std::vector<uint8_t> EncodeSignature(const std::vector<SignatureElement> &elements,
                                      bool output);
 std::vector<uint8_t> EncodeResourceDefinitions(const MirProgram &program);
+std::vector<uint8_t> EncodeStatistics(const MirProgram &program);
 
 } // namespace dxcb5
 #endif

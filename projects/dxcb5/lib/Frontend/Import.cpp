@@ -91,9 +91,10 @@ uint32_t SignatureComponent(const DxilSignatureElement &Element) {
 
 bool ImportSignature(const DxilSignature &Source,
                      ArrayRef<SignatureElement> Vertex,
-                     bool LinkPixel, unsigned RegisterCount,
+                     bool Pixel, bool IsInput, unsigned RegisterCount,
                      std::vector<SignatureElement> &Result,
                      SignatureMap &Indices, std::string &Error) {
+  const bool LinkPixel = Pixel && IsInput && !Vertex.empty();
   uint32_t Next = Source.NumVectorsUsed();
   for (const auto &Element : Vertex)
     Next = std::max(Next, Element.Register + 1);
@@ -109,9 +110,9 @@ bool ImportSignature(const DxilSignature &Source,
       Out.SystemValue = System;
       Out.ComponentType = SignatureComponent(*Element);
       Out.Interpolation = static_cast<unsigned>(Element->GetInterpolationMode()->GetKind());
-      if (LinkPixel && Out.SystemValue == D3D_NAME_COVERAGE)
+      if (Pixel && IsInput && Out.SystemValue == D3D_NAME_COVERAGE)
         continue;
-      const bool SpecialOut = !LinkPixel && IsSpecialPixelOutput(Out);
+      const bool SpecialOut = Pixel && !IsInput && IsSpecialPixelOutput(Out);
       if (!Out.ComponentType ||
           (!Element->IsAllocated() && !RasterizerInput(Out) && !SpecialOut)) {
         Error = "unsupported SM5 signature element " + Out.Semantic;
@@ -125,7 +126,7 @@ bool ImportSignature(const DxilSignature &Source,
         Result.push_back(std::move(Out));
         continue;
       }
-      Out.Register = Element->IsAllocated() ? Element->GetStartRow() + Row : Next;
+      Out.Register = Element->IsAllocated() ? Element->GetStartRow() + Row : Next++;
       Out.Mask = Element->IsAllocated() ? Element->GetColsAsMask() : 1;
       Out.UsedMask = RasterizerInput(Out) ? Out.Mask : Element->GetUsageMask();
       if (LinkPixel) {
@@ -514,10 +515,10 @@ bool dxcb5::ImportInterface(DxilModule &Module, ArrayRef<SignatureElement> Verte
                                     : D3D11_VS_INPUT_REGISTER_COUNT;
   const auto OutputRegisters = Pixel ? D3D11_PS_OUTPUT_REGISTER_COUNT
                                      : D3D11_VS_OUTPUT_REGISTER_COUNT;
-  return ImportSignature(Module.GetInputSignature(), Vertex, Pixel,
+  return ImportSignature(Module.GetInputSignature(), Vertex, Pixel, true,
                          InputRegisters,
                          Program.Inputs, Layout.Input, Error) &&
-         ImportSignature(Module.GetOutputSignature(), {}, false,
+         ImportSignature(Module.GetOutputSignature(), {}, Pixel, false,
                          OutputRegisters,
                          Program.Outputs, Layout.Output, Error) &&
          ImportResources(Module, Program, Layout, Error);

@@ -21,6 +21,7 @@ namespace {
 constexpr auto InputSignature = FourCC('I', 'S', 'G', 'N');
 constexpr auto OutputSignature = FourCC('O', 'S', 'G', 'N');
 constexpr auto ShaderCode = FourCC('S', 'H', 'E', 'X');
+constexpr auto ShaderStats = FourCC('S', 'T', 'A', 'T');
 constexpr auto RegisterMaskShift = 4;
 
 D3D10_SB_OPERAND_TYPE RegisterType(OperandKind kind) {
@@ -467,6 +468,7 @@ bool WriteContainer(const MirProgram &program, CShaderAsm &assembler,
   auto inputs = EncodeSignature(program.Inputs, false);
   auto outputs = EncodeSignature(program.Outputs, true);
   auto reflection = EncodeResourceDefinitions(program);
+  auto stats = EncodeStatistics(program);
   std::unique_ptr<DxilContainerWriter> container(NewDxilContainerWriter());
   AddPart(*container, DFCC_ResourceDef, reflection);
   AddPart(*container, InputSignature, inputs);
@@ -474,6 +476,7 @@ bool WriteContainer(const MirProgram &program, CShaderAsm &assembler,
   AddPart(*container, ShaderCode,
           {reinterpret_cast<const uint8_t *>(assembler.GetShader()),
            assembler.ShaderSizeInBytes()});
+  AddPart(*container, ShaderStats, stats);
 
   const uint64_t features = ShaderFeatures(program);
   if (features)

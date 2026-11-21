@@ -3,7 +3,9 @@
 #include "dxcb5/DxbcWriter.h"
 #include "Support/DXIncludes.h"
 #include "dxc/DxilContainer/DxilContainer.h"
+#include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <tuple>
 
@@ -328,6 +330,52 @@ std::vector<uint8_t> EncodeResourceDefinitions(const MirProgram &program) {
   out.PatchWord(24, out.AppendString("DXCB5"));
   out.Align();
   return std::move(out.Data);
+}
+
+std::vector<uint8_t> EncodeStatistics(const MirProgram &program) {
+  std::array<uint32_t, 37> stats{};
+  stats[0] = static_cast<uint32_t>(program.Instructions.size());
+  stats[1] = program.TempCount;
+  stats[3] = static_cast<uint32_t>(
+      program.ConstantBuffers.size() + program.Resources.size() +
+      program.Inputs.size() + program.Outputs.size() +
+      (program.TempCount ? 1u : 0u) + program.IndexableTemps.size());
+  stats[10] = static_cast<uint32_t>(program.IndexableTemps.size());
+  for (const auto &inst : program.Instructions) {
+    switch (inst.Opcode) {
+    case D3D10_SB_OPCODE_MOV: ++stats[19]; break;
+    case D3D10_SB_OPCODE_MOVC: ++stats[20]; break;
+    case D3D10_SB_OPCODE_FTOI: case D3D10_SB_OPCODE_FTOU:
+    case D3D10_SB_OPCODE_ITOF: case D3D10_SB_OPCODE_UTOF:
+    case D3D11_SB_OPCODE_F16TOF32: case D3D11_SB_OPCODE_F32TOF16:
+      ++stats[21]; break;
+    case D3D10_SB_OPCODE_IF: case D3D10_SB_OPCODE_SWITCH:
+    case D3D10_SB_OPCODE_BREAKC: case D3D10_SB_OPCODE_CONTINUEC:
+    case D3D10_SB_OPCODE_RETC:
+      ++stats[8]; ++stats[7]; break;
+    case D3D10_SB_OPCODE_ELSE: case D3D10_SB_OPCODE_ENDIF:
+    case D3D10_SB_OPCODE_LOOP: case D3D10_SB_OPCODE_ENDLOOP:
+    case D3D10_SB_OPCODE_ENDSWITCH: case D3D10_SB_OPCODE_RET:
+      ++stats[7]; break;
+    case D3D10_SB_OPCODE_SAMPLE: case D3D10_SB_OPCODE_SAMPLE_L:
+    case D3D10_1_SB_OPCODE_GATHER4: case D3D11_SB_OPCODE_GATHER4_PO:
+    case D3D10_1_SB_OPCODE_LOD:
+      ++stats[14]; break;
+    case D3D10_SB_OPCODE_LD: case D3D10_SB_OPCODE_LD_MS:
+    case D3D11_SB_OPCODE_LD_RAW: case D3D11_SB_OPCODE_LD_STRUCTURED:
+    case D3D11_SB_OPCODE_LD_UAV_TYPED:
+      ++stats[15]; break;
+    case D3D10_SB_OPCODE_SAMPLE_C: case D3D10_SB_OPCODE_SAMPLE_C_LZ:
+    case D3D11_SB_OPCODE_GATHER4_C: case D3D11_SB_OPCODE_GATHER4_PO_C:
+      ++stats[16]; break;
+    case D3D10_SB_OPCODE_SAMPLE_B: ++stats[17]; break;
+    case D3D10_SB_OPCODE_SAMPLE_D: ++stats[18]; break;
+    default: ++stats[4]; break;
+    }
+  }
+  std::vector<uint8_t> bytes(stats.size() * sizeof(uint32_t));
+  std::memcpy(bytes.data(), stats.data(), bytes.size());
+  return bytes;
 }
 
 } // namespace dxcb5
