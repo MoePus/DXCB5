@@ -266,6 +266,12 @@ namespace {
     CloningDirector *Director;
     ValueMapTypeRemapper *TypeMapper;
     ValueMaterializer *Materializer;
+    // HLSL Change: DXC runs AlwaysInliner before Mem2Reg, so constant scalar
+    // arguments still pass through single-store local allocas. Forwarding
+    // constant integer stores to loads during cloning lets existing BranchInst
+    // and SwitchInst pruning eliminate dead cases immediately.
+    DenseMap<const StoreInst *, const AllocaInst *> SingleStoreToAlloca;
+    DenseMap<const AllocaInst *, ConstantInt *> ConstAllocaValues;
 
   public:
     PruningFunctionCloner(Function *newFunc, const Function *oldFunc,
@@ -282,6 +288,56 @@ namespace {
       } else {
         TypeMapper = nullptr;
         Materializer = nullptr;
+      }
+    }
+
+    // HLSL Change: identify non-escaped single-store integer allocas in entry.
+    void CollectSingleStoreAllocas() {
+      if (Director || OldFunc->empty())
+        return;
+      const BasicBlock &Entry = OldFunc->getEntryBlock();
+      for (const Instruction &I : Entry) {
+        const AllocaInst *AI = dyn_cast<AllocaInst>(&I);
+        if (!AI || AI->isArrayAllocation() ||
+            !AI->getAllocatedType()->isIntegerTy())
+          continue;
+        const StoreInst *SingleStore = nullptr;
+        bool Valid = true;
+        for (const User *U : AI->users()) {
+          if (const StoreInst *SI = dyn_cast<StoreInst>(U)) {
+            if (SingleStore || SI->isVolatile() || SI->isAtomic() ||
+                SI->getPointerOperand() != AI || SI->getValueOperand() == AI ||
+                SI->getValueOperand()->getType() != AI->getAllocatedType()) {
+              Valid = false;
+              break;
+            }
+            SingleStore = SI;
+          } else if (const LoadInst *LI = dyn_cast<LoadInst>(U)) {
+            if (LI->isVolatile() || LI->isAtomic() ||
+                LI->getPointerOperand() != AI ||
+                LI->getType() != AI->getAllocatedType()) {
+              Valid = false;
+              break;
+            }
+          } else if (const BitCastInst *BCI = dyn_cast<BitCastInst>(U)) {
+            for (const User *BU : BCI->users()) {
+              const IntrinsicInst *Intrin = dyn_cast<IntrinsicInst>(BU);
+              if (!Intrin ||
+                  (Intrin->getIntrinsicID() != Intrinsic::lifetime_start &&
+                   Intrin->getIntrinsicID() != Intrinsic::lifetime_end)) {
+                Valid = false;
+                break;
+              }
+            }
+            if (!Valid)
+              break;
+          } else {
+            Valid = false;
+            break;
+          }
+        }
+        if (Valid && SingleStore)
+          SingleStoreToAlloca[SingleStore] = AI;
       }
     }
 
@@ -347,6 +403,19 @@ void PruningFunctionCloner::CloneBlock(const BasicBlock *BB,
         continue;
     }
 
+    // HLSL Change: forward constant value from single-store integer alloca.
+    if (!ConstAllocaValues.empty()) {
+      if (const LoadInst *LI = dyn_cast<LoadInst>(II)) {
+        if (const AllocaInst *AI = dyn_cast<AllocaInst>(LI->getPointerOperand())) {
+          auto It = ConstAllocaValues.find(AI);
+          if (It != ConstAllocaValues.end()) {
+            VMap[II] = It->second;
+            continue;
+          }
+        }
+      }
+    }
+
     Instruction *NewInst = II->clone();
 
     // Eagerly remap operands to the newly cloned instruction, except for PHI
@@ -355,6 +424,18 @@ void PruningFunctionCloner::CloneBlock(const BasicBlock *BB,
       RemapInstruction(NewInst, VMap,
                        ModuleLevelChanges ? RF_None : RF_NoModuleLevelChanges,
                        TypeMapper, Materializer);
+
+      // HLSL Change: record constant store to single-store integer alloca.
+      if (!SingleStoreToAlloca.empty()) {
+        if (const StoreInst *OldSI = dyn_cast<StoreInst>(II)) {
+          auto It = SingleStoreToAlloca.find(OldSI);
+          if (It != SingleStoreToAlloca.end()) {
+            if (ConstantInt *CI =
+                    dyn_cast<ConstantInt>(cast<StoreInst>(NewInst)->getValueOperand()))
+              ConstAllocaValues[It->second] = CI;
+          }
+        }
+      }
 
       // If we can simplify this instruction to some other value, simply add
       // a mapping to that value rather than inserting a new instruction into
@@ -505,6 +586,11 @@ void llvm::CloneAndPruneIntoFromInst(Function *NewFunc, const Function *OldFunc,
     StartingBB = &OldFunc->getEntryBlock();
     StartingInst = StartingBB->begin();
   }
+  // HLSL Change: enable constant single-store alloca forwarding when cloning
+  // from function entry (the standard inlining path).
+  if (StartingBB == &OldFunc->getEntryBlock() &&
+      StartingInst == StartingBB->begin())
+    PFC.CollectSingleStoreAllocas();
 
   // Clone the entry block, and anything recursively reachable from it.
   std::vector<const BasicBlock*> CloneWorklist;

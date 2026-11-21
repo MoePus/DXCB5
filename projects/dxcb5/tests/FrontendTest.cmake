@@ -72,6 +72,12 @@ verify_dxbc("${vertex}" "${TEST_DIR}/pixel_getdim_od.dxbc"
 compile_shader("${DXCB5}" ps_5_0 "${TEST_DIR}/pixel_xtemp.dxbc" "(53484452|53484558)"
   -D EXPECTED_MAJOR=5 -D TEST_INDEXABLE_TEMP=1 --vs-dxbc "${vertex}")
 verify_dxbc("${vertex}" "${TEST_DIR}/pixel_xtemp.dxbc" "dcl_indexableTemp")
+compile_shader("${DXCB5}" ps_5_0 "${TEST_DIR}/pixel_inline_switch_od.dxbc" "(53484452|53484558)"
+  -Od -D EXPECTED_MAJOR=5 -D TEST_INLINE_SWITCH_PRUNE=1 --vs-dxbc "${vertex}")
+verify_dxbc("${vertex}" "${TEST_DIR}/pixel_inline_switch_od.dxbc" "ps_5_0")
+compile_shader("${DXCB5}" ps_5_0 "${TEST_DIR}/pixel_inline_switch_o3.dxbc" "(53484452|53484558)"
+  -O3 -D EXPECTED_MAJOR=5 -D TEST_INLINE_SWITCH_PRUNE=1 --vs-dxbc "${vertex}")
+verify_dxbc("${vertex}" "${TEST_DIR}/pixel_inline_switch_o3.dxbc" "ps_5_0")
 expect_dxcb5_error("incompatible vertex output for pixel input COLOR0"
   -T ps_5_0 -E shade -Fo "${unused}" -D EXPECTED_MAJOR=5
   -D INCOMPATIBLE_COLOR=1 --vs-dxbc "${vertex}")

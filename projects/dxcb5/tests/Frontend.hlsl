@@ -60,6 +60,33 @@ float4 shade(float4 color : COLOR0) : SV_Target0 {
   double d = 2.0 + (double)color.x;
   return float4((float)(1.0 / d), 0, 0, 1);
 }
+#elif TEST_INLINE_SWITCH_PRUNE
+cbuffer SwitchData : register(b0) { float4 Table[16]; };
+float4 ReadPanel(uint panel) {
+  [branch] switch (panel) {
+  case 0: return Table[0];
+  case 1: return Table[1];
+  case 2: return Table[2];
+  case 3: return Table[3];
+  case 4: return Table[4];
+  case 5: return Table[5];
+  case 6: return Table[6];
+  case 7: return Table[7];
+  default: return float4(0, 0, 0, 0);
+  }
+}
+float4 EvalGroup(uint group) {
+  return ReadPanel(group * 2u + 0u) + ReadPanel(group * 2u + 1u);
+}
+void MutateInOut(inout uint idx, uint delta) { idx = idx + delta; }
+float4 shade(float4 color : COLOR0) : SV_Target0 {
+  // Constant-arg multi-level switch pruning: all switches fold during inlining.
+  float4 sum = EvalGroup(0u) + EvalGroup(1u) + EvalGroup(2u) + EvalGroup(3u);
+  // Multi-store / inout safety: must NOT fold away dynamic mutation.
+  uint dyn = 1u;
+  MutateInOut(dyn, (uint)color.x);
+  return sum + Table[dyn & 15u];
+}
 #else
 float4 shade(float4 color : COLOR0) : SV_Target0 { return color; }
 #endif
