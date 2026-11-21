@@ -56,6 +56,10 @@ void OptimizeSsaMir(SsaProgram &Ssa) {
       break;
   }
 
+  if (Ssa.Mir.IndexableTemps.size() >= 2 &&
+      RunOptIndexableCopy(Ssa, EnsureDom()))
+    RunOptIndexableTemps(Ssa);
+
   if (RunOptIndexablePack(Ssa)) {
     RunOptCopiesAndModifiers(Ssa);
     RunOptSlpVectorize(Ssa);

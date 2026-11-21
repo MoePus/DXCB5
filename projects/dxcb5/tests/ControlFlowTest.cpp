@@ -1360,6 +1360,63 @@ bool CheckDropRedundantTrailingMov() {
          Skipped.Run() && Skipped.Output == std::vector<uint32_t>{7, 7};
 }
 
+bool CheckNestedArmHoistAndElseDominatingDrop() {
+  // Nested if/else cascade:
+  //   if (r0.x) { r1 = 0; }
+  //   else {
+  //     if (r0.y) { r1 = 0; }
+  //     else { r1 = r0.z + 5; r2 = r1 + 1; }
+  //   }
+  // Hoisting `r1 = 0` across the nested if/else AND dropping the redundant
+  // inner `r1 = 0` should eliminate all ELSEs and keep only one `mov r1, 0`.
+  enum BlockID { Entry, OuterThen, OuterElse, InnerThen, InnerElse, Join, Count };
+  std::vector<FlowBlock> Blocks(Count);
+  Blocks[Entry].Kind = FlowKind::Branch;
+  Blocks[Entry].Condition = Register(0, 0);
+  Blocks[Entry].Instructions = {{D3D10_SB_OPCODE_MOV, {Register(2), Literal(9)}}};
+  Blocks[Entry].Edges = {{OuterThen, {}}, {OuterElse, {}}};
+  Blocks[OuterThen].Kind = FlowKind::Jump;
+  Blocks[OuterThen].Edges = {{Join, {{1, Literal(0)}}}};
+  Blocks[OuterElse].Kind = FlowKind::Branch;
+  Blocks[OuterElse].Condition = Register(0, 1);
+  Blocks[OuterElse].Edges = {{InnerThen, {}}, {InnerElse, {}}};
+  Blocks[InnerThen].Kind = FlowKind::Jump;
+  Blocks[InnerThen].Edges = {{Join, {{1, Literal(0)}}}};
+  Blocks[InnerElse].Kind = FlowKind::Jump;
+  Blocks[InnerElse].Instructions = {
+      {D3D10_SB_OPCODE_IADD, {Register(1), Register(0, 2), Literal(5)}},
+      {D3D10_SB_OPCODE_IADD, {Register(2), Register(1), Literal(1)}}};
+  Blocks[InnerElse].Edges = {{Join, {}}};
+  Blocks[Join].Kind = FlowKind::Return;
+  Blocks[Join].Instructions = {Observe(Register(1)), Observe(Register(2))};
+
+  MirProgram Program;
+  Program.TempCount = 3;
+  std::string Error;
+  if (!LowerControlFlow(Blocks, Program, Error))
+    return false;
+  unsigned ZeroMovs = 0, Elses = 0;
+  for (const auto &I : Program.Instructions) {
+    if (I.Opcode == D3D10_SB_OPCODE_ELSE)
+      ++Elses;
+    if (I.Opcode == D3D10_SB_OPCODE_MOV && I.Operands.size() == 2 &&
+        I.Operands[0].Kind == OperandKind::Temp && I.Operands[0].Index == 1 &&
+        I.Operands[1].Kind == OperandKind::Immediate && I.Operands[1].Index == 0)
+      ++ZeroMovs;
+  }
+  if (Elses != 0 || ZeroMovs != 1) {
+    std::cerr << "Expected 0 elses and 1 zero mov, got elses=" << Elses
+              << " zeroMovs=" << ZeroMovs << '\n';
+    return false;
+  }
+  TraceExecution T10(Program, RegisterLanes{1, 0, 10});
+  TraceExecution T01(Program, RegisterLanes{0, 1, 10});
+  TraceExecution T00(Program, RegisterLanes{0, 0, 10});
+  return T10.Run() && T10.Output == std::vector<uint32_t>{0, 9} &&
+         T01.Run() && T01.Output == std::vector<uint32_t>{0, 9} &&
+         T00.Run() && T00.Output == std::vector<uint32_t>{15, 16};
+}
+
 } // namespace
 
 int main() {
@@ -1370,7 +1427,8 @@ int main() {
       !CheckEarlyExitAndLatchContinueLoop() ||
       !CheckIfDiscardFold() ||
       !CheckEarlyRetSharedTail() ||
-      !CheckDropRedundantTrailingMov()) {
+      !CheckDropRedundantTrailingMov() ||
+      !CheckNestedArmHoistAndElseDominatingDrop()) {
     std::cerr << "Incorrect switch grouping or hybrid local dispatch loop\n";
     return 1;
   }

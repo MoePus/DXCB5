@@ -62,6 +62,54 @@ bool FoldSaturatePhi(AlgContext &Ctx, SsaInst &Inst, const SsaPhi &Phi) {
   return true;
 }
 
+bool IsKnownUnitInterval(const AlgContext &Ctx, const Operand &Op, uint8_t Mask,
+                         unsigned Depth) {
+  if (Depth > 4 || Op.Modifier != 0 || Op.RelativeRegister != UINT32_MAX)
+    return false;
+  if (Op.Kind == OperandKind::Immediate) {
+    const float F = BitsToFloat(Op.Index);
+    return F >= 0.0f && F <= 1.0f;
+  }
+  if (Op.Kind == OperandKind::ImmediateVector)
+    return Op.Index < Ctx.Ssa.Mir.LiteralVectors.size() &&
+           AllLanesInUnitRange(Ctx.Ssa, Op, Mask);
+  if (Op.Kind != OperandKind::Temp || Op.Index >= Ctx.Defs.size())
+    return false;
+  const auto &D = Ctx.Defs[Op.Index];
+  if (!D.Valid() || D.IsAux)
+    return false;
+  uint8_t InnerMask = 0;
+  for (unsigned L = 0; L < kRegisterLanes; ++L)
+    if (Mask & (1u << L))
+      InnerMask |= static_cast<uint8_t>(1u << GetSwizzleLane(Op.Swizzle, L));
+  if (D.IsPhi) {
+    const auto &Phi = Ctx.Ssa.Blocks[D.Block].Phis[D.Index];
+    if (Phi.Dead || (Phi.Mask & InnerMask) != InnerMask ||
+        Phi.Inputs.empty() || Phi.Inputs.size() > 4)
+      return false;
+    for (const auto &In : Phi.Inputs)
+      if (!IsKnownUnitInterval(Ctx, In.Value, InnerMask, Depth + 1))
+        return false;
+    return true;
+  }
+  const auto &P = Ctx.Ssa.Blocks[D.Block].Insts[D.Index];
+  if (P.Dead || (P.Dest.Mask & InnerMask) != InnerMask)
+    return false;
+  if (P.Saturate)
+    return true;
+  if (P.Opcode == D3D10_SB_OPCODE_MOV && P.Sources.size() == 1)
+    return IsKnownUnitInterval(Ctx, P.Sources[0], InnerMask, Depth + 1);
+  if ((P.Opcode == D3D10_SB_OPCODE_MIN || P.Opcode == D3D10_SB_OPCODE_MAX ||
+       P.Opcode == D3D10_SB_OPCODE_MUL) &&
+      P.Sources.size() == 2)
+    return IsKnownUnitInterval(Ctx, P.Sources[0], InnerMask, Depth + 1) &&
+           IsKnownUnitInterval(Ctx, P.Sources[1], InnerMask, Depth + 1);
+  if (P.Opcode == D3D10_SB_OPCODE_MOVC && P.Sources.size() == 3)
+    return IsKnownUnitInterval(Ctx, P.Sources[1], InnerMask, Depth + 1) &&
+           IsKnownUnitInterval(Ctx, P.Sources[2], InnerMask, Depth + 1);
+  return false;
+}
+
 bool SimplifyMovSatInst(AlgContext &Ctx, uint32_t B, SsaInst &Inst) {
   if (!Inst.Saturate)
     return false;
@@ -73,6 +121,10 @@ bool SimplifyMovSatInst(AlgContext &Ctx, uint32_t B, SsaInst &Inst) {
     const float Clamped = V < 0.0f ? 0.0f : (V > 1.0f ? 1.0f : V);
     Inst.Saturate = false;
     Inst.Sources[0] = MakeImm(FloatToBits(Clamped));
+    return true;
+  }
+  if (!Inst.Precise && IsKnownUnitInterval(Ctx, Src, Inst.Dest.Mask, 0)) {
+    Inst.Saturate = false;
     return true;
   }
   if (Src.Kind != OperandKind::Temp || Src.Modifier ||

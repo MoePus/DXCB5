@@ -1832,6 +1832,180 @@ bool TestRound3RegressionsAndPerf() {
   return true;
 }
 
+bool TestWriteOnceDedupLanePackAndUnitSat() {
+  const Operand NullOp{OperandKind::Null};
+  const Operand In0{OperandKind::Input, 0, 0, 1, 0};
+  const Operand In0Y{OperandKind::Input, 0, 0, 1, 0x55};
+  const Operand In1{OperandKind::Input, 1, 0, 1, 0};
+
+  // 1. Two identical write-once [6 x float] arrays (x1 dominates x0) deduplicate to 1.
+  {
+    MirProgram Mir;
+    Mir.ShaderStage = Stage::Pixel;
+    Mir.IndexableTemps.push_back({0, 6, 1});
+    Mir.IndexableTemps.push_back({1, 6, 1});
+    SsaProgram Ssa(Mir);
+    Ssa.Blocks.resize(2);
+    auto &B0 = Ssa.Blocks[0];
+    B0.Kind = FlowKind::Jump;
+    B0.Successors = {1};
+    for (uint32_t E = 0; E < 6; ++E) {
+      Operand Val = E < 3 ? Operand{OperandKind::ConstantBuffer, 0, E, 1, 0}
+                          : MakeImm(0);
+      B0.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                          Operand{OperandKind::IndexableTemp, 1, E, 1, 0},
+                          NullOp, {Val}});
+    }
+    const uint32_t Idx = Ssa.AllocValue();
+    const uint32_t V1 = Ssa.AllocValue();
+    B0.Insts.push_back({D3D10_SB_OPCODE_FTOU, MakeSsaTemp(Idx), NullOp, {In0}});
+    Operand Dyn1{OperandKind::IndexableTemp, 1, 0, 1, 0};
+    Dyn1.RelativeRegister = Idx;
+    B0.Insts.push_back({D3D10_SB_OPCODE_MOV, MakeSsaTemp(V1), NullOp, {Dyn1}});
+
+    auto &B1 = Ssa.Blocks[1];
+    B1.Kind = FlowKind::Return;
+    for (uint32_t E = 0; E < 6; ++E) {
+      Operand Val = E < 3 ? Operand{OperandKind::ConstantBuffer, 0, E, 1, 0}
+                          : MakeImm(0);
+      B1.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                          Operand{OperandKind::IndexableTemp, 0, E, 1, 0},
+                          NullOp, {Val}});
+    }
+    const uint32_t V0 = Ssa.AllocValue();
+    Operand Dyn0{OperandKind::IndexableTemp, 0, 0, 1, 0};
+    Dyn0.RelativeRegister = Idx;
+    B1.Insts.push_back({D3D10_SB_OPCODE_MOV, MakeSsaTemp(V0), NullOp, {Dyn0}});
+    B1.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                        Operand{OperandKind::Output, 0, 0, 1, 0}, NullOp,
+                        {MakeSsaTemp(V1)}});
+    B1.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                        Operand{OperandKind::Output, 1, 0, 1, 0}, NullOp,
+                        {MakeSsaTemp(V0)}});
+    OptimizeSsaMir(Ssa);
+    std::string Err;
+    if (!Ssa.Verify(Err) || Mir.IndexableTemps.size() != 1) {
+      std::fprintf(stderr, "WriteOnceDedup failed: err='%s' arrays=%zu\n",
+                   Err.c_str(), Mir.IndexableTemps.size());
+      return false;
+    }
+  }
+
+  // 2. Lane-aware store vectorization merges .y stores across a .x-only dynamic
+  // read when the .y source is already available before the .x read.
+  {
+    MirProgram Mir;
+    Mir.ShaderStage = Stage::Pixel;
+    Mir.IndexableTemps.push_back({0, 4, 1});
+    Mir.IndexableTemps.push_back({1, 4, 1});
+    SsaProgram Ssa(Mir);
+    Ssa.Blocks.resize(1);
+    auto &B = Ssa.Blocks[0];
+    B.Kind = FlowKind::Return;
+    for (uint32_t E = 0; E < 4; ++E)
+      B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                         Operand{OperandKind::IndexableTemp, 0, E, 1, 0},
+                         NullOp, {In0}});
+    const uint32_t Idx = Ssa.AllocValue();
+    const uint32_t R0 = Ssa.AllocValue();
+    const uint32_t R1 = Ssa.AllocValue();
+    const uint32_t R2 = Ssa.AllocValue();
+    B.Insts.push_back({D3D10_SB_OPCODE_FTOU, MakeSsaTemp(Idx), NullOp, {In1}});
+    Operand Dyn0{OperandKind::IndexableTemp, 0, 0, 1, 0};
+    Dyn0.RelativeRegister = Idx;
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV, MakeSsaTemp(R0), NullOp, {Dyn0}});
+    for (uint32_t E = 0; E < 4; ++E)
+      B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                         Operand{OperandKind::IndexableTemp, 1, E, 1, 0},
+                         NullOp, {In0Y}});
+    Operand Dyn1{OperandKind::IndexableTemp, 1, 0, 1, 0};
+    Dyn1.RelativeRegister = Idx;
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV, MakeSsaTemp(R1), NullOp, {Dyn0}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV, MakeSsaTemp(R2), NullOp, {Dyn1}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 0, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(R0)}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 1, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(R1)}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 2, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(R2)}});
+    std::string Err;
+    if (!RunOptIndexablePack(Ssa) || !Ssa.Verify(Err)) {
+      std::fprintf(stderr, "LanePack verify failed: %s\n", Err.c_str());
+      return false;
+    }
+    unsigned VecStores = 0;
+    for (const auto &I : B.Insts)
+      VecStores += (I.Dest.Kind == OperandKind::IndexableTemp && I.Dest.Mask == 0x3u);
+    if (VecStores != 4) {
+      std::fprintf(stderr, "LanePack expected 4 merged .xy stores, got %u\n", VecStores);
+      return false;
+    }
+  }
+
+  // 3. Redundant mov_sat drops on min(sat(a), sat(b)), stays on add(sat(a), sat(b)).
+  {
+    MirProgram Mir;
+    Mir.ShaderStage = Stage::Pixel;
+    SsaProgram Ssa(Mir);
+    Ssa.Blocks.resize(1);
+    auto &B = Ssa.Blocks[0];
+    B.Kind = FlowKind::Return;
+    const uint32_t S0 = Ssa.AllocValue(), S1 = Ssa.AllocValue();
+    const uint32_t Mn = Ssa.AllocValue(), SatMn = Ssa.AllocValue();
+    const uint32_t Sm = Ssa.AllocValue(), SatSm = Ssa.AllocValue();
+    SsaInst M0{D3D10_SB_OPCODE_MOV, MakeSsaTemp(S0), NullOp, {In0}};
+    M0.Saturate = true;
+    SsaInst M1{D3D10_SB_OPCODE_MOV, MakeSsaTemp(S1), NullOp, {In1}};
+    M1.Saturate = true;
+    B.Insts.push_back(M0);
+    B.Insts.push_back(M1);
+    B.Insts.push_back({D3D10_SB_OPCODE_MIN, MakeSsaTemp(Mn), NullOp,
+                       {MakeSsaTemp(S0), MakeSsaTemp(S1)}});
+    SsaInst ClampMn{D3D10_SB_OPCODE_MOV, MakeSsaTemp(SatMn), NullOp,
+                    {MakeSsaTemp(Mn)}};
+    ClampMn.Saturate = true;
+    B.Insts.push_back(ClampMn);
+    B.Insts.push_back({D3D10_SB_OPCODE_ADD, MakeSsaTemp(Sm), NullOp,
+                       {MakeSsaTemp(S0), MakeSsaTemp(S1)}});
+    SsaInst ClampSm{D3D10_SB_OPCODE_MOV, MakeSsaTemp(SatSm), NullOp,
+                    {MakeSsaTemp(Sm)}};
+    ClampSm.Saturate = true;
+    B.Insts.push_back(ClampSm);
+    // Keep Mn multi-used so sat cannot simply fold onto MIN; must be proved redundant.
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 0, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(Mn)}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 1, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(SatMn)}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 2, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(Sm)}});
+    B.Insts.push_back({D3D10_SB_OPCODE_MOV,
+                       Operand{OperandKind::Output, 3, 0, 1, 0}, NullOp,
+                       {MakeSsaTemp(SatSm)}});
+    OptimizeSsaMir(Ssa);
+    std::string Err;
+    if (!Ssa.Verify(Err)) {
+      std::fprintf(stderr, "UnitSat verify failed: %s\n", Err.c_str());
+      return false;
+    }
+    unsigned MovSatCount = 0;
+    for (const auto &I : B.Insts)
+      MovSatCount += (I.Opcode == D3D10_SB_OPCODE_MOV && I.Saturate);
+    // Expect 3 mov_sat: S0, S1, and SatSm (NOT SatMn!).
+    if (MovSatCount != 3) {
+      std::fprintf(stderr, "UnitSat expected 3 mov_sat (dropped SatMn, kept SatSm), got %u\n",
+                   MovSatCount);
+      return false;
+    }
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
@@ -1864,6 +2038,8 @@ int main() {
   if (!TestVsOptimizations())
     return 1;
   if (!TestRound3RegressionsAndPerf())
+    return 1;
+  if (!TestWriteOnceDedupLanePackAndUnitSat())
     return 1;
   return 0;
 }

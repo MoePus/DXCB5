@@ -176,7 +176,189 @@ bool WritesOverlapDstOrSrc(const Instruction &CI, const Operand &Dst,
   return false;
 }
 
+bool SameMovCoveredByPrev(const Instruction &Prev, const Instruction &Inner) {
+  const auto &Dst = Inner.Operands[0];
+  const auto &Src = Inner.Operands[1];
+  if (!IsHoistableMov(Prev) || Prev.Operands[0].Index != Dst.Index ||
+      (Prev.Operands[0].Mask & Dst.Mask) != Dst.Mask ||
+      !SameMovSourceBase(Prev.Operands[1], Src))
+    return false;
+  if (Src.Kind == OperandKind::Immediate)
+    return true;
+  for (unsigned L = 0; L < 4u; ++L)
+    if ((Dst.Mask & (1u << L)) &&
+        ((Prev.Operands[1].Swizzle >> (2u * L)) & 3u) !=
+            ((Src.Swizzle >> (2u * L)) & 3u))
+      return false;
+  return true;
+}
+
+bool AllWrittenOverwritten(
+    const llvm::SmallDenseMap<uint32_t, uint8_t, 4> &WrittenLanes,
+    const llvm::SmallDenseMap<uint32_t, uint8_t, 4> &DefWritten) {
+  for (const auto &KV : WrittenLanes)
+    if ((DefWritten.lookup(KV.first) & KV.second) != KV.second)
+      return false;
+  return true;
+}
+
+bool FindMatchingControlSpan(const std::vector<Instruction> &Code, size_t I,
+                             size_t End, size_t &ElsePos, size_t &EndPos) {
+  ElsePos = std::numeric_limits<size_t>::max();
+  EndPos = std::numeric_limits<size_t>::max();
+  int Depth = 0;
+  for (size_t J = I + 1; J < End; ++J) {
+    const uint32_t Op = Code[J].Opcode;
+    if (IsControlFlowBegin(Op)) {
+      ++Depth;
+    } else if (IsControlFlowEnd(Op)) {
+      if (Depth == 0) {
+        EndPos = J;
+        return true;
+      }
+      --Depth;
+    } else if (Op == D3D10_SB_OPCODE_ELSE && Depth == 0 &&
+               Code[I].Opcode == D3D10_SB_OPCODE_IF) {
+      ElsePos = J;
+    }
+  }
+  return false;
+}
+
+bool CheckOverwrittenRange(
+    const std::vector<Instruction> &Code, size_t Begin, size_t End,
+    const llvm::SmallDenseMap<uint32_t, uint8_t, 4> &WrittenLanes,
+    llvm::SmallDenseMap<uint32_t, uint8_t, 4> &DefWritten, unsigned Depth) {
+  if (Depth > 16)
+    return false;
+  for (size_t I = Begin; I < End; ++I) {
+    const auto &Inst = Code[I];
+    const uint32_t Op = Inst.Opcode;
+    if (InstReadsRemaining(Inst, WrittenLanes, DefWritten))
+      return false;
+    if (IsExitOrDiscardOp(Op) &&
+        !AllWrittenOverwritten(WrittenLanes, DefWritten))
+      return false;
+    if (Op == D3D10_SB_OPCODE_IF) {
+      size_t ElsePos = 0, EndPos = 0;
+      if (!FindMatchingControlSpan(Code, I, End, ElsePos, EndPos))
+        return false;
+      auto ThenDef = DefWritten;
+      if (ElsePos == std::numeric_limits<size_t>::max()) {
+        if (!CheckOverwrittenRange(Code, I + 1, EndPos, WrittenLanes, ThenDef,
+                                   Depth + 1))
+          return false;
+      } else {
+        auto ElseDef = DefWritten;
+        if (!CheckOverwrittenRange(Code, I + 1, ElsePos, WrittenLanes, ThenDef,
+                                   Depth + 1) ||
+            !CheckOverwrittenRange(Code, ElsePos + 1, EndPos, WrittenLanes,
+                                   ElseDef, Depth + 1))
+          return false;
+        for (const auto &KV : WrittenLanes)
+          DefWritten[KV.first] |=
+              static_cast<uint8_t>(ThenDef.lookup(KV.first) &
+                                   ElseDef.lookup(KV.first));
+      }
+      I = EndPos;
+      continue;
+    }
+    if (IsControlFlowBegin(Op)) {
+      size_t UnusedElse = 0, EndPos = 0;
+      if (!FindMatchingControlSpan(Code, I, End, UnusedElse, EndPos))
+        return false;
+      for (size_t K = I + 1; K < EndPos; ++K) {
+        if (InstReadsRemaining(Code[K], WrittenLanes, DefWritten))
+          return false;
+        if (IsExitOrDiscardOp(Code[K].Opcode) &&
+            !AllWrittenOverwritten(WrittenLanes, DefWritten))
+          return false;
+      }
+      I = EndPos;
+      continue;
+    }
+    const unsigned NumDests = InstructionDestinationCount(Op);
+    for (unsigned D = 0; D < NumDests && D < Inst.Operands.size(); ++D) {
+      const auto &Dst = Inst.Operands[D];
+      if (Dst.Kind == OperandKind::Temp &&
+          Dst.RelativeRegister == UINT32_MAX && WrittenLanes.count(Dst.Index))
+        DefWritten[Dst.Index] |= Dst.Mask;
+    }
+  }
+  return true;
+}
+
+size_t FindMatchingIfBack(const std::vector<Instruction> &Insts,
+                          size_t ElsePos) {
+  int Depth = 0;
+  for (size_t K = ElsePos; K > 0; --K) {
+    const uint32_t Op = Insts[K - 1].Opcode;
+    if (IsControlFlowEnd(Op)) {
+      ++Depth;
+    } else if (IsControlFlowBegin(Op)) {
+      if (Depth == 0)
+        return Op == D3D10_SB_OPCODE_IF ? (K - 1)
+                                        : std::numeric_limits<size_t>::max();
+      --Depth;
+    }
+  }
+  return std::numeric_limits<size_t>::max();
+}
+
+bool HasDominatingCoveredMov(const std::vector<Instruction> &Insts,
+                             size_t DomAnchor, const Instruction &Inner,
+                             const Operand &Dst, const Operand &Src,
+                             uint8_t SrcRead) {
+  for (size_t P = DomAnchor, Steps = 0; P > 0 && Steps < 32; ++Steps) {
+    const auto &Prev = Insts[P - 1];
+    const uint32_t Op = Prev.Opcode;
+    if (Op == D3D10_SB_OPCODE_IF) {
+      --P;
+      continue;
+    }
+    if (Op == D3D10_SB_OPCODE_ELSE) {
+      const size_t MatchIf = FindMatchingIfBack(Insts, P - 1);
+      if (MatchIf == std::numeric_limits<size_t>::max())
+        return false;
+      P = MatchIf;
+      continue;
+    }
+    if (IsControlFlowBegin(Op) || IsControlFlowEnd(Op) ||
+        Op == D3D10_SB_OPCODE_CASE || Op == D3D10_SB_OPCODE_DEFAULT ||
+        IsExitOrDiscardOp(Op))
+      return false;
+    if (SameMovCoveredByPrev(Prev, Inner))
+      return true;
+    if (WritesOverlapDstOrSrc(Prev, Dst, Src, SrcRead))
+      return false;
+    --P;
+  }
+  return false;
+}
+
 } // namespace
+
+bool dxcb5::flow::TryDropRedundantLeadingMov(std::vector<Instruction> &Insts,
+                                             size_t DomAnchor, size_t MovPos) {
+  if (DomAnchor == 0 || MovPos >= Insts.size() ||
+      !IsHoistableMov(Insts[MovPos]))
+    return false;
+  const auto &Inner = Insts[MovPos];
+  const auto &Dst = Inner.Operands[0];
+  const auto &Src = Inner.Operands[1];
+  const uint8_t SrcRead =
+      Src.Kind == OperandKind::Temp
+          ? InstructionSourceReadLanes(D3D10_SB_OPCODE_MOV, Dst.Mask, 0,
+                                       Src.Swizzle)
+          : 0;
+  if (Src.Kind == OperandKind::Temp && Src.Index == Dst.Index &&
+      (Dst.Mask & SrcRead) != 0)
+    return false;
+  if (!HasDominatingCoveredMov(Insts, DomAnchor, Inner, Dst, Src, SrcRead))
+    return false;
+  Insts.erase(Insts.begin() + MovPos);
+  return true;
+}
 
 bool dxcb5::flow::TryDropRedundantTrailingMov(std::vector<Instruction> &Insts,
                                               size_t I, size_t EndPos) {
@@ -196,33 +378,10 @@ bool dxcb5::flow::TryDropRedundantTrailingMov(std::vector<Instruction> &Insts,
   for (size_t K = I + 1; K + 1 < EndPos; ++K)
     if (WritesOverlapDstOrSrc(Insts[K], Dst, Src, SrcRead))
       return false;
-  for (size_t P = I, Steps = 0; P > 0 && Steps < 32; --P, ++Steps) {
-    const auto &Prev = Insts[P - 1];
-    const uint32_t Op = Prev.Opcode;
-    if (IsControlFlowBegin(Op) || IsControlFlowEnd(Op) ||
-        Op == D3D10_SB_OPCODE_ELSE || Op == D3D10_SB_OPCODE_CASE ||
-        Op == D3D10_SB_OPCODE_DEFAULT || IsExitOrDiscardOp(Op))
-      return false;
-    if (IsHoistableMov(Prev) && Prev.Operands[0].Index == Dst.Index &&
-        (Prev.Operands[0].Mask & Dst.Mask) == Dst.Mask &&
-        SameMovSourceBase(Prev.Operands[1], Src)) {
-      bool LanesOk = true;
-      if (Src.Kind != OperandKind::Immediate) {
-        for (unsigned L = 0; L < 4u; ++L)
-          if ((Dst.Mask & (1u << L)) &&
-              ((Prev.Operands[1].Swizzle >> (2u * L)) & 3u) !=
-                  ((Src.Swizzle >> (2u * L)) & 3u))
-            LanesOk = false;
-      }
-      if (LanesOk) {
-        Insts.erase(Insts.begin() + (EndPos - 1));
-        return true;
-      }
-    }
-    if (WritesOverlapDstOrSrc(Prev, Dst, Src, SrcRead))
-      return false;
-  }
-  return false;
+  if (!HasDominatingCoveredMov(Insts, I, Inner, Dst, Src, SrcRead))
+    return false;
+  Insts.erase(Insts.begin() + (EndPos - 1));
+  return true;
 }
 
 bool dxcb5::flow::IsSafeToHoistArmBeforeIf(const Instruction &IfInst,
@@ -230,7 +389,7 @@ bool dxcb5::flow::IsSafeToHoistArmBeforeIf(const Instruction &IfInst,
                                            size_t SmallBegin, size_t SmallEnd,
                                            size_t OtherBegin, size_t OtherEnd) {
   const size_t Count = SmallEnd - SmallBegin;
-  if (Count == 0 || Count > 2)
+  if (Count == 0 || Count > 3)
     return false;
   llvm::SmallDenseMap<uint32_t, uint8_t, 4> WrittenLanes;
   for (size_t I = SmallBegin; I < SmallEnd; ++I) {
@@ -248,39 +407,10 @@ bool dxcb5::flow::IsSafeToHoistArmBeforeIf(const Instruction &IfInst,
     return false;
 
   llvm::SmallDenseMap<uint32_t, uint8_t, 4> DefWritten;
-  int Depth = 0;
-  auto AllOverwritten = [&]() -> bool {
-    for (const auto &KV : WrittenLanes)
-      if ((DefWritten.lookup(KV.first) & KV.second) != KV.second)
-        return false;
-    return true;
-  };
-  for (size_t I = OtherBegin; I < OtherEnd; ++I) {
-    const auto &Inst = Code[I];
-    const uint32_t Op = Inst.Opcode;
-    if (InstReadsRemaining(Inst, WrittenLanes, DefWritten))
-      return false;
-    if (IsExitOrDiscardOp(Op) && !AllOverwritten())
-      return false;
-    if (IsControlFlowBegin(Op)) {
-      ++Depth;
-      continue;
-    }
-    if (IsControlFlowEnd(Op)) {
-      --Depth;
-      continue;
-    }
-    if (Depth != 0)
-      continue;
-    const unsigned NumDests = InstructionDestinationCount(Op);
-    for (unsigned D = 0; D < NumDests && D < Inst.Operands.size(); ++D) {
-      const auto &Dst = Inst.Operands[D];
-      if (Dst.Kind == OperandKind::Temp &&
-          Dst.RelativeRegister == UINT32_MAX && WrittenLanes.count(Dst.Index))
-        DefWritten[Dst.Index] |= Dst.Mask;
-    }
-  }
-  return AllOverwritten();
+  if (!CheckOverwrittenRange(Code, OtherBegin, OtherEnd, WrittenLanes,
+                             DefWritten, 0))
+    return false;
+  return AllWrittenOverwritten(WrittenLanes, DefWritten);
 }
 
 void dxcb5::flow::HoistLoopExitFlags(std::vector<Instruction> &Insts) {

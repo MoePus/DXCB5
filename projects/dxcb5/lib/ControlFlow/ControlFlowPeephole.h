@@ -61,6 +61,8 @@ bool IsSafeToHoistArmBeforeIf(const Instruction &IfInst,
                               const std::vector<Instruction> &Code,
                               size_t SmallBegin, size_t SmallEnd,
                               size_t OtherBegin, size_t OtherEnd);
+bool TryDropRedundantLeadingMov(std::vector<Instruction> &Insts,
+                                size_t DomAnchor, size_t MovPos);
 bool TryDropRedundantTrailingMov(std::vector<Instruction> &Insts, size_t I,
                                  size_t EndPos);
 void OptimizeStructuredCode(std::vector<Instruction> &Insts);

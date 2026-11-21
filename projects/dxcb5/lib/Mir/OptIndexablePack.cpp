@@ -1,5 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
 #include "Mir/OptPipeline.h"
+#include "dxcb5/InstructionInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
@@ -398,6 +399,9 @@ struct PendingStoreGroup {
   Operand BaseSrc;
   uint8_t LaneMask = 0;
   uint8_t Count = 0;
+  bool EmitAtAnchor = false;
+  uint32_t AnchorIdx = 0;
+  uint8_t BlockedLanes = 0;
   std::array<uint32_t, 4> InstIdx{};
   std::array<uint8_t, 4> DstLane{};
   std::array<Operand, 4> Srcs{};
@@ -407,10 +411,11 @@ void FlushStoreGroup(SsaProgram &Ssa, SsaBlock &Block,
                      const PendingStoreGroup &G) {
   if (G.Count < 2)
     return;
-  const uint32_t Last = G.InstIdx[G.Count - 1];
-  for (uint8_t M = 0; M + 1 < G.Count; ++M)
-    Block.Insts[G.InstIdx[M]].Dead = true;
-  Block.Insts[Last].Dest.Mask = G.LaneMask;
+  const uint32_t Target = G.EmitAtAnchor ? G.AnchorIdx : G.InstIdx[G.Count - 1];
+  for (uint8_t M = 0; M < G.Count; ++M)
+    if (G.InstIdx[M] != Target)
+      Block.Insts[G.InstIdx[M]].Dead = true;
+  Block.Insts[Target].Dest.Mask = G.LaneMask;
   if (G.IsImm) {
     std::array<uint32_t, 4> Bits = {0, 0, 0, 0};
     for (uint8_t M = 0; M < G.Count; ++M)
@@ -418,7 +423,7 @@ void FlushStoreGroup(SsaProgram &Ssa, SsaBlock &Block,
     const uint32_t LitId =
         static_cast<uint32_t>(Ssa.Mir.LiteralVectors.size());
     Ssa.Mir.LiteralVectors.push_back(Bits);
-    Block.Insts[Last].Sources[0] =
+    Block.Insts[Target].Sources[0] =
         Operand{OperandKind::ImmediateVector, LitId, 0, 0xfu, 0xe4u};
     return;
   }
@@ -427,7 +432,7 @@ void FlushStoreGroup(SsaProgram &Ssa, SsaBlock &Block,
   for (uint8_t M = 0; M < G.Count; ++M)
     VecSrc.Swizzle = SetSwizzleLane(VecSrc.Swizzle, G.DstLane[M],
                                     GetSwizzleLane(G.Srcs[M].Swizzle, 0));
-  Block.Insts[Last].Sources[0] = VecSrc;
+  Block.Insts[Target].Sources[0] = VecSrc;
 }
 
 void FlushStoresMatching(SsaProgram &Ssa, SsaBlock &Block,
@@ -443,16 +448,57 @@ void FlushStoresMatching(SsaProgram &Ssa, SsaBlock &Block,
   Active.resize(Keep);
 }
 
-void VectorizeBlockConstStores(SsaProgram &Ssa, SsaBlock &Block) {
+uint8_t ComputeIndexableReadLanes(const SsaInst &Inst, size_t SrcIdx,
+                                  const Operand &Src) {
+  if (IsPseudoOpcode(Inst.Opcode))
+    return 0xfu;
+  uint8_t DMask = Inst.Dest.Mask;
+  if (Inst.AuxDest.Kind != OperandKind::Null)
+    DMask |= Inst.AuxDest.Mask;
+  return InstructionSourceReadLanes(Inst.Opcode, DMask, SrcIdx, Src.Swizzle);
+}
+
+bool IsSrcAvailableAt(uint32_t BlockId, const std::vector<SsaDefSite> &Defs,
+                      const Operand &Src, uint32_t TargetIdx) {
+  if (Src.RelativeRegister != UINT32_MAX)
+    return false;
+  if (Src.Kind != OperandKind::Temp)
+    return true;
+  if (Src.Index >= Defs.size() || !Defs[Src.Index].Valid())
+    return false;
+  const auto &D = Defs[Src.Index];
+  return D.Block != BlockId || D.IsPhi || D.Index < TargetIdx;
+}
+
+void NoteArrayRead(llvm::SmallVectorImpl<PendingStoreGroup> &Active,
+                   const SsaInst &Inst, size_t SrcIdx, const Operand &Src) {
+  const uint8_t RL = ComputeIndexableReadLanes(Inst, SrcIdx, Src);
+  for (auto &G : Active) {
+    if (G.NewX != Src.Index)
+      continue;
+    if (G.EmitAtAnchor) {
+      G.BlockedLanes |= RL;
+    } else if ((G.LaneMask & RL) != 0) {
+      G.EmitAtAnchor = true;
+      G.AnchorIdx = G.InstIdx[G.Count - 1];
+      G.BlockedLanes = RL;
+    }
+  }
+}
+
+void VectorizeBlockConstStores(SsaProgram &Ssa, uint32_t BlockId,
+                               const std::vector<SsaDefSite> &Defs) {
+  SsaBlock &Block = Ssa.Blocks[BlockId];
   const size_t NumX = Ssa.Mir.IndexableTemps.size();
   llvm::SmallVector<PendingStoreGroup, 16> Active;
   for (uint32_t I = 0; I < Block.Insts.size(); ++I) {
     const auto &Inst = Block.Insts[I];
     if (Inst.Dead)
       continue;
-    for (const auto &Src : Inst.Sources)
-      if (Src.Kind == OperandKind::IndexableTemp && Src.Index < NumX)
-        FlushStoresMatching(Ssa, Block, Active, Src.Index);
+    for (size_t SI = 0; SI < Inst.Sources.size(); ++SI)
+      if (Inst.Sources[SI].Kind == OperandKind::IndexableTemp &&
+          Inst.Sources[SI].Index < NumX)
+        NoteArrayRead(Active, Inst, SI, Inst.Sources[SI]);
     if (Inst.Dest.Kind != OperandKind::IndexableTemp || Inst.Dest.Index >= NumX)
       continue;
     const uint32_t X = Inst.Dest.Index;
@@ -482,12 +528,18 @@ void VectorizeBlockConstStores(SsaProgram &Ssa, SsaBlock &Block) {
     PendingStoreGroup *Match = nullptr;
     for (auto &G : Active) {
       if (G.NewX == X && G.Elem == Elem && G.IsImm == IsImm &&
-          (IsImm || SameStoreBase(G.BaseSrc, Src))) {
+          (IsImm || SameStoreBase(G.BaseSrc, Src)) &&
+          (!G.EmitAtAnchor ||
+           (!(G.BlockedLanes & (1u << Lane)) &&
+            IsSrcAvailableAt(BlockId, Defs, Src, G.AnchorIdx)))) {
         Match = &G;
         break;
       }
     }
     if (!Match) {
+      for (auto &G : Active)
+        if (G.NewX == X && G.Elem == Elem && G.EmitAtAnchor)
+          G.BlockedLanes |= static_cast<uint8_t>(1u << Lane);
       Active.push_back(PendingStoreGroup{X, Elem, IsImm, Src, 0, 0});
       Match = &Active.back();
     }
@@ -502,8 +554,10 @@ void VectorizeBlockConstStores(SsaProgram &Ssa, SsaBlock &Block) {
 }
 
 void VectorizePackedConstStores(SsaProgram &Ssa) {
-  for (auto &Block : Ssa.Blocks)
-    VectorizeBlockConstStores(Ssa, Block);
+  std::vector<SsaDefSite> Defs;
+  Ssa.BuildDefTable(Defs);
+  for (uint32_t B = 0; B < Ssa.Blocks.size(); ++B)
+    VectorizeBlockConstStores(Ssa, B, Defs);
 }
 
 } // namespace

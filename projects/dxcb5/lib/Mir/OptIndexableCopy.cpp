@@ -239,6 +239,193 @@ void RewriteCopyReadsAndKillStores(SsaProgram &Ssa, const SsaDomTree &Dom,
   }
 }
 
+bool ResolveInvariantInitVal(const SsaProgram &Ssa,
+                             const std::vector<SsaDefSite> &Defs, Operand Op,
+                             Operand &Out) {
+  for (unsigned Hop = 0; Hop < 4; ++Hop) {
+    if (Op.RelativeRegister != UINT32_MAX)
+      return false;
+    if (Op.Kind == OperandKind::Immediate) {
+      Op.Mask = 1;
+      Op.Swizzle = 0;
+      Out = Op;
+      return true;
+    }
+    if (Op.Kind == OperandKind::ImmediateVector) {
+      if (Op.Modifier != 0 || Op.Index >= Ssa.Mir.LiteralVectors.size())
+        return false;
+      const uint32_t Bits =
+          Ssa.Mir.LiteralVectors[Op.Index][GetSwizzleLane(Op.Swizzle, 0)];
+      Out = Operand{OperandKind::Immediate, Bits, 0, 1, 0};
+      return true;
+    }
+    if (Op.Kind == OperandKind::ConstantBuffer ||
+        Op.Kind == OperandKind::Input ||
+        Op.Kind == OperandKind::ImmediateConstantBuffer) {
+      Op.Mask = 1;
+      Op.Swizzle = static_cast<uint8_t>(GetSwizzleLane(Op.Swizzle, 0) * 0x55u);
+      Out = Op;
+      return true;
+    }
+    if (Op.Kind != OperandKind::Temp || Op.Modifier != 0 ||
+        Op.Index >= Defs.size())
+      return false;
+    const auto &D = Defs[Op.Index];
+    if (!D.Valid() || D.IsPhi || D.IsAux)
+      return false;
+    const auto &DefI = Ssa.Blocks[D.Block].Insts[D.Index];
+    const unsigned Lane = GetSwizzleLane(Op.Swizzle, 0);
+    if (DefI.Dead || DefI.Saturate || DefI.Opcode != D3D10_SB_OPCODE_MOV ||
+        DefI.Sources.size() != 1 || !(DefI.Dest.Mask & (1u << Lane)))
+      return false;
+    const Operand &Src0 = DefI.Sources[0];
+    if (Src0.Kind == OperandKind::Immediate) {
+      Op = Src0;
+    } else {
+      const uint8_t NextLane = GetSwizzleLane(Src0.Swizzle, Lane);
+      Op = Src0;
+      Op.Swizzle = static_cast<uint8_t>(NextLane * 0x55u);
+    }
+  }
+  return false;
+}
+
+struct WriteOnceInit {
+  uint32_t X = UINT32_MAX;
+  uint32_t StoreBlock = UINT32_MAX;
+  uint32_t LastStore = 0;
+  std::vector<Operand> Values;
+};
+
+bool CollectWriteOnceInit(const SsaProgram &Ssa, const SsaDomTree &Dom,
+                          const std::vector<SsaDefSite> &Defs,
+                          const ArrayAccessSummary &AInfo, uint32_t X,
+                          WriteOnceInit &Out) {
+  const auto &Decl = Ssa.Mir.IndexableTemps[X];
+  const uint32_t N = Decl.Elements;
+  if (Decl.Components != 1 || N == 0 || N > 64 || AInfo.HasDynWrite ||
+      AInfo.HasUnsafeUse || AInfo.MultiStoreBlock ||
+      AInfo.StoreBlock == UINT32_MAX || AInfo.TotalStores != N ||
+      AInfo.ReadBlocks.empty())
+    return false;
+  const uint32_t B = AInfo.StoreBlock;
+  for (uint32_t RB : AInfo.ReadBlocks)
+    if (!Dom.Dominates(B, RB))
+      return false;
+
+  const auto &Insts = Ssa.Blocks[B].Insts;
+  std::vector<uint8_t> Seen(N, 0);
+  std::vector<Operand> Vals(N);
+  uint32_t LastStore = 0;
+  uint32_t FirstRead = UINT32_MAX;
+  for (uint32_t I = 0; I < Insts.size(); ++I) {
+    const auto &Inst = Insts[I];
+    if (Inst.Dead)
+      continue;
+    for (const auto &S : Inst.Sources)
+      if (S.Kind == OperandKind::IndexableTemp && S.Index == X &&
+          FirstRead == UINT32_MAX)
+        FirstRead = I;
+    if (Inst.Dest.Kind != OperandKind::IndexableTemp || Inst.Dest.Index != X)
+      continue;
+    const uint32_t Elem = Inst.Dest.Element;
+    if (Elem >= N || Seen[Elem] || Inst.Dest.Mask != 1)
+      return false;
+    Operand Resolved;
+    if (!ResolveInvariantInitVal(Ssa, Defs, Inst.Sources[0], Resolved))
+      return false;
+    Seen[Elem] = 1;
+    Vals[Elem] = Resolved;
+    LastStore = I;
+  }
+  if (FirstRead <= LastStore)
+    return false;
+  Out = {X, B, LastStore, std::move(Vals)};
+  return true;
+}
+
+uint32_t FindFirstReadInBlock(const SsaBlock &Block, uint32_t ArrayX) {
+  for (uint32_t I = 0; I < Block.Insts.size(); ++I) {
+    if (Block.Insts[I].Dead)
+      continue;
+    for (const auto &S : Block.Insts[I].Sources)
+      if (S.Kind == OperandKind::IndexableTemp && S.Index == ArrayX)
+        return I;
+  }
+  return UINT32_MAX;
+}
+
+bool SameWriteOnceValues(const std::vector<Operand> &A,
+                         const std::vector<Operand> &B) {
+  if (A.size() != B.size())
+    return false;
+  for (size_t I = 0; I < A.size(); ++I)
+    if (!A[I].SameValue(B[I]))
+      return false;
+  return true;
+}
+
+bool CanCanonDominateDupReads(const SsaProgram &Ssa, const SsaDomTree &Dom,
+                              const ArrayAccessSummary &DupInfo,
+                              const WriteOnceInit &Canon,
+                              const WriteOnceInit &Dup) {
+  for (uint32_t RB : DupInfo.ReadBlocks) {
+    if (!Dom.Dominates(Canon.StoreBlock, RB))
+      return false;
+    if (RB == Canon.StoreBlock &&
+        FindFirstReadInBlock(Ssa.Blocks[RB], Dup.X) <= Canon.LastStore)
+      return false;
+  }
+  return true;
+}
+
+bool DedupWriteOnceArrays(SsaProgram &Ssa, const SsaDomTree &Dom,
+                          const std::vector<SsaDefSite> &Defs,
+                          std::vector<ArrayAccessSummary> &Info) {
+  const size_t NumX = Ssa.Mir.IndexableTemps.size();
+  std::vector<uint32_t> RpoPos(Ssa.Blocks.size(), UINT32_MAX);
+  for (uint32_t Pos = 0; Pos < Dom.RpoOrder.size(); ++Pos)
+    RpoPos[Dom.RpoOrder[Pos]] = Pos;
+
+  std::vector<WriteOnceInit> Inits;
+  for (uint32_t X = 0; X < NumX; ++X) {
+    WriteOnceInit W;
+    if (CollectWriteOnceInit(Ssa, Dom, Defs, Info[X], X, W))
+      Inits.push_back(std::move(W));
+  }
+  if (Inits.size() < 2)
+    return false;
+
+  std::sort(Inits.begin(), Inits.end(),
+            [&](const WriteOnceInit &A, const WriteOnceInit &B) {
+              if (RpoPos[A.StoreBlock] != RpoPos[B.StoreBlock])
+                return RpoPos[A.StoreBlock] < RpoPos[B.StoreBlock];
+              return A.LastStore < B.LastStore;
+            });
+
+  bool Changed = false;
+  std::vector<uint8_t> Eliminated(Inits.size(), 0);
+  for (size_t J = 1; J < Inits.size(); ++J) {
+    const auto &Dup = Inits[J];
+    for (size_t I = 0; I < J; ++I) {
+      if (Eliminated[I])
+        continue;
+      const auto &Canon = Inits[I];
+      if (!SameWriteOnceValues(Canon.Values, Dup.Values) ||
+          !CanCanonDominateDupReads(Ssa, Dom, Info[Dup.X], Canon, Dup))
+        continue;
+      RewriteCopyReadsAndKillStores(Ssa, Dom, Dup.X, Canon.X, Dup.StoreBlock);
+      for (uint32_t RB : Info[Dup.X].ReadBlocks)
+        AddUnique(Info[Canon.X].ReadBlocks, RB);
+      Info[Dup.X] = {};
+      Eliminated[J] = 1;
+      Changed = true;
+      break;
+    }
+  }
+  return Changed;
+}
+
 } // namespace
 
 bool dxcb5::RunOptIndexableCopy(SsaProgram &Ssa, const SsaDomTree &Dom) {
@@ -256,7 +443,8 @@ bool dxcb5::RunOptIndexableCopy(SsaProgram &Ssa, const SsaDomTree &Dom) {
   for (unsigned Round = 0; Round < 4; ++Round) {
     std::vector<ArrayAccessSummary> Info;
     CollectArraySummaries(Ssa, Dom, Info);
-    bool RoundChanged = false;
+    bool RoundChanged = DedupWriteOnceArrays(Ssa, Dom, Defs, Info);
+    AnyChanged |= RoundChanged;
     for (uint32_t DstX = 0; DstX < NumX; ++DstX) {
       CopyMatch Match;
       if (!MatchSingleBlockCopy(Ssa, Defs, Info[DstX], DstX, Match))

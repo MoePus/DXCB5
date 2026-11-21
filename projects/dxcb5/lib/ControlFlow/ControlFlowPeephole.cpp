@@ -140,39 +140,6 @@ void TryFoldPrecedingMovIntoMovc(std::vector<Instruction> &Insts, size_t &I,
   }
 }
 
-bool TryDropRedundantLeadingMov(std::vector<Instruction> &Insts, size_t I,
-                                size_t EndPos) {
-  if (I == 0 || EndPos <= I + 1 || !IsHoistableMov(Insts[I + 1]))
-    return false;
-  const auto &Inner = Insts[I + 1];
-  const auto &Dst = Inner.Operands[0];
-  const auto &Src = Inner.Operands[1];
-  const uint8_t SrcRead =
-      Src.Kind == OperandKind::Temp
-          ? InstructionSourceReadLanes(D3D10_SB_OPCODE_MOV, Dst.Mask, 0,
-                                       Src.Swizzle)
-          : 0;
-  if (Src.Kind == OperandKind::Temp && Src.Index == Dst.Index &&
-      (Dst.Mask & SrcRead) != 0)
-    return false;
-  for (size_t P = I; P > 0; --P) {
-    const auto &Prev = Insts[P - 1];
-    if (!IsHoistableMov(Prev))
-      return false;
-    if (SameInstructionExact(Prev, Inner)) {
-      Insts.erase(Insts.begin() + I + 1);
-      return true;
-    }
-    const auto &PD = Prev.Operands[0];
-    if (PD.Index == Dst.Index && (PD.Mask & Dst.Mask))
-      return false;
-    if (Src.Kind == OperandKind::Temp && PD.Index == Src.Index &&
-        (PD.Mask & SrcRead))
-      return false;
-  }
-  return false;
-}
-
 bool TryFlattenIfMovsToMovc(std::vector<Instruction> &Insts, size_t &I,
                             size_t EndPos) {
   if ((EndPos != I + 2 && EndPos != I + 3) || Insts[I].Operands.size() != 1 ||
@@ -387,7 +354,7 @@ bool SimplifyIfNoElse(std::vector<Instruction> &Insts, size_t &I,
     ++I;
     return true;
   }
-  if (TryDropRedundantLeadingMov(Insts, I, EndPos) ||
+  if ((EndPos > I + 1 && TryDropRedundantLeadingMov(Insts, I, I + 1)) ||
       TryDropRedundantTrailingMov(Insts, I, EndPos))
     return true;
   return TryFlattenIfMovsToMovc(Insts, I, EndPos);
@@ -404,6 +371,9 @@ bool SimplifyIfWithElse(std::vector<Instruction> &Insts, size_t &I,
     Insts.erase(Insts.begin() + ElsePos);
     return true;
   }
+  if (TryDropRedundantLeadingMov(Insts, I, I + 1) ||
+      TryDropRedundantLeadingMov(Insts, I, ElsePos + 1))
+    return true;
   if (IsUnconditionalExitOp(Insts[ElsePos - 1].Opcode)) {
     Insts[ElsePos] = Instruction{D3D10_SB_OPCODE_ENDIF, {}};
     Insts.erase(Insts.begin() + EndPos);
