@@ -348,9 +348,10 @@ int main(int argc, char **argv) {
             "Expected automatic FXC bypass after com.moepus.dxcb5 is removed");
     SetEnvironmentVariableW(L"DXCB5_UNITY_PROJECT_DIR", nullptr);
 
-    // 7. Peer NativeDispatchTable (peloader bridge) compile + preprocess.
+    // 7. Peer NativeDispatchTable (peloader bridge) compile + preprocess,
+    //    plus legacy -Gec mutable global uniform (lilToon/Poiyomi pattern).
     {
-      ComPtr<ID3DBlob> bridgeBlob, preBlob;
+      ComPtr<ID3DBlob> bridgeBlob, preBlob, gecBlob;
       Require(SUCCEEDED(peerDisp->D3DPreprocess(
                   kDx11Src, std::strlen(kDx11Src), "dx11.hlsl", nullptr,
                   nullptr, &preBlob, &errBlob)),
@@ -360,6 +361,25 @@ int main(int argc, char **argv) {
                   nullptr, "PSMain", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3,
                   0, &bridgeBlob, &errBlob)),
               "Peer NativeDispatchTable D3DCompile failed");
+      const char *kMutableGlobalSrc = R"HLSL(
+        float _Flag;
+        float _Limit;
+        float4 MutableGlobalPS(float4 pos : SV_POSITION) : SV_TARGET {
+          if (_Flag == 0.0) { _Limit = 0.5; }
+          float r = fmod(pos.x, _Limit);
+          return float4(_Limit, r, 0.75, 1.0);
+        }
+      )HLSL";
+      Require(SUCCEEDED(fnCompile(
+                  kMutableGlobalSrc, std::strlen(kMutableGlobalSrc), "gec.hlsl",
+                  nullptr, nullptr, "MutableGlobalPS", "ps_5_0",
+                  D3DCOMPILE_OPTIMIZATION_LEVEL3 |
+                      D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY,
+                  0, &gecBlob, &errBlob)),
+              "Legacy -Gec mutable global uniform ps_5_0 compile failed");
+      const std::string gecLog = ReadFileText(cfgDir + L"\\stats.log");
+      Require(gecLog.find("HIT\tps_5_0\tMutableGlobalPS") != std::string::npos,
+              "Expected DXCB5 HIT (via -HV 2016 -Gec) for MutableGlobalPS");
     }
 
     // 8. stats.log rotation to stats.log.1 once size exceeds 512 KB.

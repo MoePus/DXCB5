@@ -1,51 +1,33 @@
 # DXCB5
 
-DXCB5 is an experimental fork of Microsoft's [DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler) that compiles HLSL directly to native **Shader Model 5.0 DXBC** (`vs_5_0` / `ps_5_0`) for Direct3D 11.
+DXCB5 is a fork of Microsoft's [DirectX Shader Compiler (DXC)](https://github.com/microsoft/DirectXShaderCompiler) that compiles HLSL directly to Direct3D 11 **Shader Model 5.0 DXBC** (`vs_5_0` / `ps_5_0`), packaged as a drop-in `D3DCompiler_47.dll` replacement for Unity 2022.3.
 
-It pairs DXC's modern HLSL frontend and LLVM middle-end with a dedicated Vector SSA MIR backend, lane-aware register allocator, structured control-flow emitter, and DXBC container writer (`RDEF`, `ISGN`, `OSGN`, `SHEX`, `STAT`, `SFI0`).
+## Installation
+
+1. Add `https://moepus.github.io/vpm/index.json` in **VCC** or **ALCOM**, then find and install **DXCB5** (`com.moepus.dxcb5`) into your project.
+2. In Unity, open **`Tools -> DXCB5 Shader Compiler`** and click **Install DXCB5 Proxy**.
 
 ## Highlights
 
-- **Code quality & GPU speed**: Matches or beats FXC instruction counts across heavy Unity/VRChat shaders (e.g., 99.26% of FXC total instructions across MoeToon2 passes; 0.984× FXC frame time on RTX 4080 in pixel-exact scissor benchmarks).
-- **Broad SM5.0 coverage**: Supports textures/samplers/arrays, `Buffer`/`StructuredBuffer`/`ByteAddressBuffer` SRVs, full UAVs (typed/structured/raw, atomics, counters), `gather4*`, `ldms`, `lod`, `GetDimensions`, `EvaluateAttribute*`, `SV_Depth*`, `SV_Coverage`, `SV_SampleIndex`, `min16*` types, `sdiv`/`srem`, `uaddc`/`usubb`, bitfield ops, and mutable `static` / local arrays.
-- **Verified**: Validated against FXC via D3D11 WARP pixel-exact readback tests, Lean 4 formal proofs for parallel copy lowering, and 740/796 (93.0%) FXC-valid SM5 shaders in DXC's test suite.
+Comparison against Unity 2022.3.22f1's bundled FXC (`D3DCompiler_47.dll`) on full-feature `ForwardBase` (`vs_5_0` + `ps_5_0`, `-O3`):
 
-## Building
+| Shader (Full Feature) | Metric | Unity FXC | DXCB5 | Diff |
+| :--- | :--- | ---: | ---: | ---: |
+| **lilToon 2.4.1** | Compile Time (VS + PS) | 1,161 ms | **360 ms** | **3.2× faster** |
+| | Instructions (VS + PS) | 3,259 (1,442 + 1,817) | 3,317 (1,469 + 1,848) | +1.8% (24/26 vs 28/28 temps) |
+| | GPU Frame Time (RTX 4080, 1024²) | 0.180 ms | **0.177 ms** | **-1.5%** |
+| **Poiyomi Pro 8.0** | Compile Time (VS + PS) | 714 ms | **289 ms** | **2.5× faster** |
+| | Instructions (VS + PS) | 2,478 (51 + 2,427) | **2,378** (52 + 2,326) | **-4.0%** |
+| | GPU Frame Time (RTX 4080, 1024²) | 0.287 ms | **0.255 ms** | **-11.1%** |
 
-Requires Visual Studio (MSVC x64), CMake, Ninja, and Windows SDK (`d3d11`, `d3dcompiler`).
-
-```powershell
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -C cmake/caches/PredefinedParams.cmake
-cmake --build build --target dxcb5 DXCB5UnityProxy DXCB5WarpABITest -j
-ctest --test-dir build/projects/dxcb5 --output-on-failure
-```
-
-## Usage
-
-```powershell
-# Compile vertex or standalone pixel shader to SM5.0 DXBC
-dxcb5.exe -T vs_5_0 -E VSMain -Fo vs.dxbc shader.hlsl
-dxcb5.exe -T ps_5_0 -E PSMain -Fo ps.dxbc shader.hlsl
-
-# Optional: link PS input signature explicitly against a VS DXBC, or enforce strict NaN semantics
-dxcb5.exe -T ps_5_0 -E PSMain --vs-dxbc vs.dxbc --nan-safe -Fo ps.dxbc shader.hlsl
-```
-
-## Unity 2022.3 / VCC Plugin
-
-`projects/dxcb5/unity-proxy/` builds a drop-in `D3DCompiler_47.dll` proxy for Unity `2022.3.22f1` (`Editor/Data/Tools/`) that routes `vs_5_0`/`ps_5_0` through `dxcb5_dxcompiler.dll` with automatic FXC fallback (`D3DCompiler_47_fxc.dll`).
-
-```powershell
-powershell -ExecutionPolicy Bypass -File projects/dxcb5/unity-vcc/package_vcc.ps1 -BuildDir build -OutDir dist-vcc
-```
-
-Install via VRChat Creator Companion (VCC) from **[https://moepus.github.io/vpm/](https://moepus.github.io/vpm/)** (`https://moepus.github.io/vpm/index.json`), or install the generated `com.moepus.dxcb5-*.zip` via UPM, then open **`Tools -> DXCB5 Shader Compiler`** in Unity.
+*Measured with interleaved dual-order D3D11 hardware timestamp queries (160 samples per shader, 0 disjoint frames); both shaders produce 0.0 maximum pixel delta vs FXC across 1,048,576 pixels.*
 
 ## Current Scope & Limits
 
-- **Targets**: `vs_5_0` and `ps_5_0` (compute/geometry/hull/domain shaders are not targeted yet).
-- **Explicitly rejected**: 64-bit numeric types (`double`, `int64_t`/`uint64_t`), D3D11.2 tiled-resource status/clamp, D3D11.3 `SV_InnerCoverage`, and `tbuffer`.
+- **Supported stages**: `vs_5_0` and `ps_5_0` (Windows x64 Unity 2022.3 Editor).
+- **Automatic FXC fallback**: Compute (`cs_5_0`), geometry (`gs_5_0`), hull/domain (`hs_5_0`/`ds_5_0`), SM 4.0 targets, and any shader rejected by DXCB5 fall back to Unity's original FXC (`D3DCompiler_47_fxc.dll`) automatically.
+- **Not supported in DXCB5**: 64-bit numeric types (`double`, `int64_t`/`uint64_t`), D3D11.2 tiled-resource status/clamp, D3D11.3 `SV_InnerCoverage`, and `tbuffer`.
 
 ## License
 
-Built on [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler) under the University of Illinois Open Source License (see [LICENSE.TXT](LICENSE.TXT)).
+Built on [DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler) under the University of Illinois Open Source License. See [LICENSE.TXT](LICENSE.TXT).

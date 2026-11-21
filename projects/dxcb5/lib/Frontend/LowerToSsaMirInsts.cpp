@@ -384,6 +384,16 @@ bool SsaLowerer::LowerInstruction(llvm::Instruction &Inst) {
   }
   if (Inst.getOpcode() == I::SDiv || Inst.getOpcode() == I::SRem)
     return LowerSignedDivRem(Inst, Dest, Precise);
+  if (Inst.getOpcode() == I::FRem) {
+    const Operand A = Source(Inst.getOperand(0));
+    const Operand B = Source(Inst.getOperand(1));
+    const auto Q = AllocTemp(Dest.Mask);
+    const auto T = AllocTemp(Dest.Mask);
+    Emit(D3D10_SB_OPCODE_DIV, Q, {A, B}, Precise);
+    Emit(D3D10_SB_OPCODE_ROUND_Z, T, {Q}, Precise);
+    Emit(D3D10_SB_OPCODE_MAD, Dest, {NegateMirOperand(Ssa, T), B, A}, Precise);
+    return Error.empty();
+  }
   if (const unsigned BinOp = BinaryOpcode(Inst.getOpcode());
       BinOp != kUnsupportedOpcode)
     return LowerBinaryInst(*this, Inst, BinOp, Dest, Precise);

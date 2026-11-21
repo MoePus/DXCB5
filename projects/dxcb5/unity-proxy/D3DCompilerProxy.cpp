@@ -442,10 +442,10 @@ bool TryCompileWithDxcb5(LPCVOID pSrcData, SIZE_T SrcDataSize,
     ownedArgs.push_back(L"-Gfa");
   if (Flags1 & D3DCOMPILE_PREFER_FLOW_CONTROL)
     ownedArgs.push_back(L"-Gfp");
-  // Note: Do NOT pass -Gec under -HV 2018 (DXC rejects "/Gec is not supported
-  // with HLSLVersion 2018"). UnityShaderCompiler sets BACKWARDS_COMPATIBILITY
-  // routinely; legacy DX9 sampler2D and `: COLOR` PS semantics are handled by
-  // UnityHlslAdapter, and anything still unsupported falls back cleanly to FXC.
+  // Note: DXC rejects "/Gec is not supported with HLSLVersion 2018".
+  // Try -HV 2018 first for modern loop scoping, and if BACKWARDS_COMPATIBILITY
+  // is requested and -HV 2018 fails (e.g. lilToon/Poiyomi mutating global
+  // uniforms), retry once with -HV 2016 -Gec.
 
   if (pDefines) {
     for (const D3D_SHADER_MACRO *m = pDefines; m->Name; ++m) {
@@ -461,11 +461,6 @@ bool TryCompileWithDxcb5(LPCVOID pSrcData, SIZE_T SrcDataSize,
   if (pSourceName && *pSourceName)
     ownedArgs.push_back(Utf8ToWide(pSourceName));
 
-  std::vector<LPCWSTR> argPtrs;
-  argPtrs.reserve(ownedArgs.size());
-  for (const auto &a : ownedArgs)
-    argPtrs.push_back(a.c_str());
-
   ComPtr<IDxcIncludeHandler> incHandler;
   if (pInclude == D3D_COMPILE_STANDARD_FILE_INCLUDE) {
     utils->CreateDefaultIncludeHandler(&incHandler);
@@ -478,17 +473,39 @@ bool TryCompileWithDxcb5(LPCVOID pSrcData, SIZE_T SrcDataSize,
   srcBuf.Size = srcLen;
   srcBuf.Encoding = CP_UTF8;
 
+  auto runCompile = [&](ComPtr<IDxcResult> &outResult, HRESULT &outStatus) {
+    std::vector<LPCWSTR> argPtrs;
+    argPtrs.reserve(ownedArgs.size());
+    for (const auto &a : ownedArgs)
+      argPtrs.push_back(a.c_str());
+    outResult.Reset();
+    outStatus = E_FAIL;
+    HRESULT hr = compiler->Compile(
+        &srcBuf, argPtrs.data(), static_cast<UINT32>(argPtrs.size()),
+        incHandler.Get(), IID_PPV_ARGS(&outResult));
+    if (FAILED(hr) || !outResult)
+      return false;
+    outResult->GetStatus(&outStatus);
+    return true;
+  };
+
   ComPtr<IDxcResult> result;
-  HRESULT hr = compiler->Compile(
-      &srcBuf, argPtrs.data(), static_cast<UINT32>(argPtrs.size()),
-      incHandler.Get(), IID_PPV_ARGS(&result));
-  if (FAILED(hr) || !result) {
+  HRESULT status = E_FAIL;
+  if (!runCompile(result, status)) {
     failReason = "IDxcCompiler3::Compile failed";
     return false;
   }
-
-  HRESULT status = E_FAIL;
-  result->GetStatus(&status);
+  if (FAILED(status) && (Flags1 & D3DCOMPILE_ENABLE_BACKWARDS_COMPATIBILITY)) {
+    // ownedArgs[0]="-fdxcb5", ownedArgs[1]="-HV", ownedArgs[2]="2018"
+    ownedArgs[2] = L"2016";
+    ownedArgs.insert(ownedArgs.begin() + 3, L"-Gec");
+    ComPtr<IDxcResult> compatResult;
+    HRESULT compatStatus = E_FAIL;
+    if (runCompile(compatResult, compatStatus)) {
+      result = std::move(compatResult);
+      status = compatStatus;
+    }
+  }
   if (FAILED(status)) {
     ComPtr<IDxcBlobUtf8> errs;
     result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errs), nullptr);
