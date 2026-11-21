@@ -30,7 +30,7 @@ jobs:
       tag: ${{ steps.plan.outputs.tag }}
       head_sha: ${{ steps.plan.outputs.head_sha }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Determine release plan
@@ -113,7 +113,7 @@ jobs:
     if: needs.check.outputs.should_build == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -132,7 +132,7 @@ jobs:
           }
 
       - name: Restore sccache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/AppData/Local/Mozilla/sccache
           key: sccache-win-x64-${{ github.sha }}
