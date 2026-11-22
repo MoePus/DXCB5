@@ -137,8 +137,7 @@ inline bool IsImulLow(const SsaInst &Inst) {
 }
 
 inline bool IsSlpBarrier(const SsaInst &Inst) {
-  if (Inst.Opcode == PseudoArrayRead || Inst.Opcode == PseudoArrayWrite ||
-      Inst.Opcode == D3D10_SB_OPCODE_DISCARD)
+  if (Inst.Opcode == D3D10_SB_OPCODE_DISCARD)
     return true;
   if (Inst.Dest.Kind == OperandKind::Output ||
       Inst.Dest.Kind == OperandKind::OutputDepth ||
@@ -200,6 +199,11 @@ bool FindPackAnchor(const SsaBlock &Block, const std::vector<SsaDefSite> &Defs,
                     const FirstLocalUseCache &FirstLocalUse,
                     uint32_t &OutAnchor,
                     const std::vector<uint32_t> *SlpBarPref = nullptr);
+
+void FindDotRedexMuls(const SsaBlock &Block,
+                      const std::vector<SsaDefSite> &Defs, uint32_t BlockId,
+                      const std::vector<uint8_t> &Escapes,
+                      std::vector<uint8_t> &OutDotMul);
 
 bool GroupScalarPhis(SsaProgram &Ssa, RemapTable &RemapCache);
 bool RunTreeSlp(SsaProgram &Ssa, FirstLocalUseCache &UseCache,

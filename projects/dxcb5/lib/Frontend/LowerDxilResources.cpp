@@ -1,5 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
 #include "Frontend/LowerToSsaMir.h"
+#include "Support/ResourceShape.h"
 #include "dxc/DXIL/DxilOperations.h"
 #include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
 #include "llvm/ADT/SmallVector.h"
@@ -79,6 +80,7 @@ unsigned SampleToken(Op Opcode) {
 
 bool AddOffsets(SsaInst &I, const CallInst &Call, unsigned Start,
                 unsigned Count = 3) {
+  int8_t Off[3] = {0, 0, 0};
   for (unsigned Axis = 0; Axis < Count; ++Axis) {
     auto *V = Call.getArgOperand(Start + Axis);
     if (isa<UndefValue>(V))
@@ -86,8 +88,10 @@ bool AddOffsets(SsaInst &I, const CallInst &Call, unsigned Start,
     auto *Offset = dyn_cast<ConstantInt>(V);
     if (!Offset || Offset->getSExtValue() < -8 || Offset->getSExtValue() > 7)
       return false;
-    I.TexelOffset[Axis] = static_cast<int8_t>(Offset->getSExtValue());
+    Off[Axis] = static_cast<int8_t>(Offset->getSExtValue());
   }
+  for (unsigned Axis = 0; Axis < Count; ++Axis)
+    I.TexelOffset[Axis] = Off[Axis];
   return true;
 }
 
@@ -96,20 +100,6 @@ bool ZeroOrUndef(const Value *V) {
     return true;
   const auto *C = dyn_cast<Constant>(V);
   return C && C->isNullValue();
-}
-
-uint8_t ComputeResRetUsedMask(const CallInst &Call) {
-  uint8_t Mask = 0;
-  for (const auto *U : Call.users()) {
-    const auto *EV = dyn_cast<ExtractValueInst>(U);
-    if (!EV || EV->getNumIndices() != 1)
-      return 0xfu;
-    const unsigned Lane = EV->getIndices()[0];
-    if (Lane >= kRegisterLanes)
-      return 0xfu;
-    Mask |= static_cast<uint8_t>(1u << Lane);
-  }
-  return Mask ? Mask : 0xfu;
 }
 
 } // namespace
@@ -257,19 +247,23 @@ bool SsaLowerer::LowerCalculateLod(CallInst &Call) {
 
 bool SsaLowerer::LowerBufferLoad(CallInst &Call, unsigned OpNumber) {
   const auto Opcode = static_cast<Op>(OpNumber);
+  if (const auto *RetST = dyn_cast<StructType>(Call.getType())) {
+    if (RetST->getNumElements() > 0) {
+      const Type *ElemTy = RetST->getElementType(0);
+      if (!ElemTy->isFloatTy() && !ElemTy->isIntegerTy(32))
+        return Fail("non-32-bit SM5 buffer load is unsupported");
+    }
+  }
   Operand Resource{OperandKind::Null};
   Kind ResourceKind = Kind::Invalid;
   if (!Handle(Call.getArgOperand(1), Resource, &ResourceKind))
     return false;
   auto Dest = Values.lookup(&Call);
-  Dest.Mask = ComputeResRetUsedMask(Call);
+  Dest.Mask = 0xfu;
   if (Opcode == Op::RawBufferLoad) {
     if (const auto *M = IntArg(Call, 4)) {
       const uint8_t Req = static_cast<uint8_t>(M->getZExtValue() & 0xfu);
-      if (Req)
-        Dest.Mask = static_cast<uint8_t>(Dest.Mask & Req);
-      if (!Dest.Mask)
-        Dest.Mask = Req ? Req : 0x1u;
+      Dest.Mask = Req ? Req : 0x1u;
     }
   }
   const Operand Index = Source(Call.getArgOperand(2));
@@ -306,12 +300,22 @@ bool SsaLowerer::LowerUavStore(CallInst &Call, unsigned OpNumber) {
     const unsigned Coords = CoordinateCount(ResourceKind);
     if (!Coords)
       return Fail("unsupported SM5 UAV store dimension");
+    const auto *TexMaskC = IntArg(Call, 9);
+    const uint8_t TexMask =
+        TexMaskC ? static_cast<uint8_t>(TexMaskC->getZExtValue() & 0xfu) : 0xfu;
     const Operand Addr = EnsureVector4(
         Ssa, ClampCoordSwizzle(VectorArgs(Call, 2, Coords), Coords));
     SmallVector<Operand, 4> ValLanes;
     for (unsigned L = 0; L < 4; ++L) {
       const Value *V = Call.getArgOperand(5 + L);
-      ValLanes.push_back(isa<UndefValue>(V) ? MakeImm(0) : Source(V));
+      if (isa<UndefValue>(V) || !(TexMask & (1u << L))) {
+        ValLanes.push_back(MakeImm(0));
+        continue;
+      }
+      const Type *ValTy = V->getType();
+      if (!ValTy->isFloatTy() && !ValTy->isIntegerTy(32))
+        return Fail("non-32-bit SM5 texture store is unsupported");
+      ValLanes.push_back(Source(V));
     }
     const Operand Val = EnsureVector4(Ssa, CombineOperands(ValLanes));
     Resource.Mask = 0xfu;
@@ -321,6 +325,13 @@ bool SsaLowerer::LowerUavStore(CallInst &Call, unsigned OpNumber) {
   const auto *MaskConst = IntArg(Call, 8);
   const uint8_t Mask =
       MaskConst ? static_cast<uint8_t>(MaskConst->getZExtValue() & 0xfu) : 0xfu;
+  for (unsigned L = 0; L < 4; ++L) {
+    if (!(Mask & (1u << L)))
+      continue;
+    const Type *ValTy = Call.getArgOperand(4 + L)->getType();
+    if (!ValTy->isFloatTy() && !ValTy->isIntegerTy(32))
+      return Fail("non-32-bit SM5 buffer store is unsupported");
+  }
   if (ResourceKind == Kind::TypedBuffer) {
     const Operand Addr =
         EnsureVector4(Ssa, ClampCoordSwizzle(Source(Call.getArgOperand(2)), 1));
@@ -517,14 +528,10 @@ bool SsaLowerer::LowerTextureDimensions(CallInst &Call) {
           IsArr ? MakeSsaLane(Dim.Index, 2) : MakeImm(0), SampVal});
     return Error.empty();
   }
-  switch (ResourceKind) {
-  case Kind::Texture1D: Dest.Mask = 0x9u; break;
-  case Kind::Texture1DArray: case Kind::Texture2D: case Kind::TextureCube:
-    Dest.Mask = 0xbu; break;
-  case Kind::Texture2DArray: case Kind::Texture3D: case Kind::TextureCubeArray:
-    Dest.Mask = 0xfu; break;
-  default: return Fail("SM5 GetDimensions unsupported resource kind");
-  }
+  const uint8_t ResMask = GetSm5ResourceShape(ResourceKind).ResInfoDestMask;
+  if (!ResMask)
+    return Fail("SM5 GetDimensions unsupported resource kind");
+  Dest.Mask = ResMask;
   Emit(D3D10_SB_OPCODE_RESINFO, Dest, {Source(Call.getArgOperand(2)), Texture});
   return Error.empty();
 }

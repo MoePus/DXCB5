@@ -1,5 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
 #include "Mir/OptPipeline.h"
+#include "Mir/SsaAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
@@ -321,8 +322,8 @@ bool ProcessImulAuxGvn(SsaInst &Inst, uint8_t Flags, ScopedGvnTable &Scope,
 
 bool TryPerLaneGvnLookup(SsaInst &Inst, uint8_t Flags, const MirProgram &Mir,
                          const ScopedGvnTable &Scope) {
-  if (IsPseudoOpcode(Inst.Opcode) || !InstructionIsComponentwise(Inst.Opcode) ||
-      Inst.Dest.Mask == 0) return false;
+  if (!InstructionIsComponentwise(Inst.Opcode) || Inst.Dest.Mask == 0)
+    return false;
   uint32_t HitReg = UINT32_MAX;
   uint8_t HitSwz = 0, FirstHitLane = 0;
   for (unsigned Lane = 0; Lane < kRegisterLanes; ++Lane) {
@@ -356,7 +357,7 @@ bool TryPerLaneGvnLookup(SsaInst &Inst, uint8_t Flags, const MirProgram &Mir,
 
 void RecordComponentwiseLanes(const SsaInst &Inst, uint8_t Flags,
                               const MirProgram &Mir, ScopedGvnTable &Scope) {
-  if (IsPseudoOpcode(Inst.Opcode) || !InstructionIsComponentwise(Inst.Opcode))
+  if (!InstructionIsComponentwise(Inst.Opcode))
     return;
   for (unsigned Lane = 0; Lane < kRegisterLanes; ++Lane) {
     if (!(Inst.Dest.Mask & (1u << Lane))) continue;
@@ -370,7 +371,48 @@ void RecordComponentwiseLanes(const SsaInst &Inst, uint8_t Flags,
   }
 }
 
+struct ScopedPredTable {
+  struct Entry { uint32_t ValId; uint8_t Lane, NonZero; };
+  llvm::SmallVector<Entry, 32> Stack;
+  size_t Mark() const { return Stack.size(); }
+  void Push(uint32_t V, uint8_t L, uint8_t NZ) { Stack.push_back({V, L, NZ}); }
+  void Rollback(size_t M) { Stack.resize(M); }
+  bool Lookup(uint32_t V, uint8_t L, uint8_t &OutNZ) const {
+    for (size_t I = Stack.size(); I-- > 0;)
+      if (Stack[I].ValId == V && Stack[I].Lane == L) { OutNZ = Stack[I].NonZero; return true; }
+    return false;
+  }
+};
+
+bool TryFoldPredicatedMovc(SsaInst &Inst, const ScopedPredTable &Preds,
+                           std::vector<Operand> &CopyOf, bool &AnyAlias) {
+  if (Inst.Opcode != D3D10_SB_OPCODE_MOVC || Inst.Sources.size() != 3 ||
+      Inst.Sources[0].Kind != OperandKind::Temp || Inst.Sources[0].Modifier ||
+      Inst.Sources[0].RelativeRegister != UINT32_MAX || Inst.Dest.Mask == 0 ||
+      Preds.Stack.empty())
+    return false;
+  uint8_t Known = 2;
+  for (unsigned L = 0; L < kRegisterLanes; ++L) {
+    if (!(Inst.Dest.Mask & (1u << L))) continue;
+    uint8_t Val = 0;
+    if (!Preds.Lookup(Inst.Sources[0].Index,
+                      GetSwizzleLane(Inst.Sources[0].Swizzle, L), Val) ||
+        (Known != 2 && Known != Val))
+      return false;
+    Known = Val;
+  }
+  if (Known == 2) return false;
+  Operand Pick = Known ? Inst.Sources[1] : Inst.Sources[2];
+  Inst.Opcode = D3D10_SB_OPCODE_MOV;
+  Inst.Sources = {Pick};
+  if (!Inst.Saturate && Inst.Dest.Kind == OperandKind::Temp &&
+      Inst.AuxDest.Kind == OperandKind::Null)
+    RecordCopy(Inst.Dest.Index, Pick, CopyOf, AnyAlias);
+  return true;
+}
+
 bool ProcessBlockGvn(SsaProgram &Ssa, SsaBlock &Block, ScopedGvnTable &Scope,
+                     const ScopedPredTable &Preds, bool FoldBranchPreds,
                      std::vector<Operand> &CopyOf, bool &AnyAlias) {
   bool Changed = false;
   for (auto &Phi : Block.Phis) {
@@ -385,6 +427,10 @@ bool ProcessBlockGvn(SsaProgram &Ssa, SsaBlock &Block, ScopedGvnTable &Scope,
       Changed |= ResolveAlias(Inst.Dest, CopyOf);
     for (auto &Src : Inst.Sources)
       Changed |= ResolveAlias(Src, CopyOf);
+    if (TryFoldPredicatedMovc(Inst, Preds, CopyOf, AnyAlias)) {
+      Changed = true;
+      continue;
+    }
     if (Inst.Opcode == D3D10_SB_OPCODE_MOV && !Inst.Saturate &&
         Inst.Dest.Kind == OperandKind::Temp &&
         Inst.AuxDest.Kind == OperandKind::Null && !Inst.Sources.empty()) {
@@ -430,36 +476,76 @@ bool ProcessBlockGvn(SsaProgram &Ssa, SsaBlock &Block, ScopedGvnTable &Scope,
     Scope.Insert(Whole, MakeWholeVal(Inst.Dest));
     RecordComponentwiseLanes(Inst, Flags, Ssa.Mir, Scope);
   }
-  if (Block.Kind == FlowKind::Branch || Block.Kind == FlowKind::Switch)
+  if (Block.Kind == FlowKind::Branch || Block.Kind == FlowKind::Switch) {
     Changed |= ResolveAlias(Block.Condition, CopyOf);
+    if (FoldBranchPreds && Block.Kind == FlowKind::Branch &&
+        Block.Condition.Kind == OperandKind::Temp && !Block.Condition.Modifier &&
+        Block.Condition.RelativeRegister == UINT32_MAX && !Preds.Stack.empty()) {
+      uint8_t Known = 0;
+      if (Preds.Lookup(Block.Condition.Index,
+                       GetSwizzleLane(Block.Condition.Swizzle, 0), Known)) {
+        Block.Condition = MakeImm(Known ? 1u : 0u);
+        Changed = true;
+      }
+    }
+  }
   return Changed;
 }
 
-bool RunGlobalGvn(SsaProgram &Ssa, const SsaDomTree &Dom) {
+bool RunGlobalGvn(SsaProgram &Ssa, const SsaDomTree &Dom, bool FoldBranchPreds) {
   if (Dom.RpoOrder.empty()) return false;
+  std::vector<llvm::SmallVector<uint32_t, 4>> ReachPreds;
+  BuildReachablePreds(Ssa, Dom, ReachPreds);
   ScopedGvnTable Scope;
+  ScopedPredTable Preds;
   std::vector<Operand> CopyOf(Ssa.NextValueId, Operand{OperandKind::Null});
   bool AnyAlias = false;
   struct Frame {
     uint32_t Block;
     size_t Mark;
+    size_t PredMark;
+    uint32_t PredValId;
+    uint8_t PredLane;
+    uint8_t PredNonZero;
     bool Exit;
   };
   llvm::SmallVector<Frame, 64> Stack;
-  Stack.push_back({0, 0, false});
+  Stack.push_back({0, 0, 0, 0, 0, 0, false});
 
   bool Changed = false;
   while (!Stack.empty()) {
     const auto Cur = Stack.pop_back_val();
     if (Cur.Exit) {
       Scope.Rollback(Cur.Mark);
+      Preds.Rollback(Cur.PredMark);
       continue;
     }
     const size_t Mark = Scope.Mark();
-    Changed |= ProcessBlockGvn(Ssa, Ssa.Blocks[Cur.Block], Scope, CopyOf, AnyAlias);
-    Stack.push_back({Cur.Block, Mark, true});
-    for (uint32_t Child : Dom.Children[Cur.Block])
-      Stack.push_back({Child, 0, false});
+    const size_t PMark = Preds.Mark();
+    if (Cur.PredValId != 0)
+      Preds.Push(Cur.PredValId, Cur.PredLane, Cur.PredNonZero);
+    Changed |= ProcessBlockGvn(Ssa, Ssa.Blocks[Cur.Block], Scope, Preds,
+                               FoldBranchPreds, CopyOf, AnyAlias);
+    Stack.push_back({Cur.Block, Mark, PMark, 0, 0, 0, true});
+    const auto &CurBlk = Ssa.Blocks[Cur.Block];
+    const bool HasBranchPred =
+        CurBlk.Kind == FlowKind::Branch && CurBlk.Successors.size() == 2 &&
+        CurBlk.Successors[0] != CurBlk.Successors[1] &&
+        CurBlk.Condition.Kind == OperandKind::Temp &&
+        !CurBlk.Condition.Modifier &&
+        CurBlk.Condition.RelativeRegister == UINT32_MAX;
+    const uint32_t BId = HasBranchPred ? CurBlk.Condition.Index : 0u;
+    const uint8_t BLane =
+        HasBranchPred ? GetSwizzleLane(CurBlk.Condition.Swizzle, 0) : 0u;
+    for (uint32_t Child : Dom.Children[Cur.Block]) {
+      const bool EdgeDom = HasBranchPred &&
+          EdgeDominatesChild(Dom, ReachPreds, Cur.Block, Child);
+      const bool IsTrue = EdgeDom && Child == CurBlk.Successors[0];
+      const bool IsFalse = EdgeDom && Child == CurBlk.Successors[1];
+      const uint32_t PId = (IsTrue || IsFalse) ? BId : 0u;
+      const uint8_t PNz = IsTrue ? 1u : 0u;
+      Stack.push_back(Frame{Child, 0, 0, PId, BLane, PNz, false});
+    }
   }
   if (AnyAlias) {
     for (auto &Block : Ssa.Blocks)
@@ -473,15 +559,17 @@ bool RunGlobalGvn(SsaProgram &Ssa, const SsaDomTree &Dom) {
 
 } // namespace
 
-bool dxcb5::RunOptGvnDce(SsaProgram &Ssa, const SsaDomTree *CachedDom) {
+bool dxcb5::RunOptGvnDce(SsaProgram &Ssa, const SsaDomTree *CachedDom,
+                         bool FoldBranchPreds, bool RunMaskedDce) {
   llvm::TimeTraceScope Scope("DXCB5 Opt GVN/DCE", llvm::StringRef());
   SsaDomTree LocalDom;
   if (!CachedDom) {
     Ssa.ComputeDominators(LocalDom);
     CachedDom = &LocalDom;
   }
-  bool Changed = RunGlobalGvn(Ssa, *CachedDom);
-  Changed |= RunOptMaskedDce(Ssa);
+  bool Changed = RunGlobalGvn(Ssa, *CachedDom, FoldBranchPreds);
+  if (RunMaskedDce)
+    Changed |= RunOptMaskedDce(Ssa);
   if (Changed)
     Ssa.CompactDead();
   return Changed;

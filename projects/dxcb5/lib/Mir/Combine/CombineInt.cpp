@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 
@@ -40,43 +40,31 @@ bool SimplifyXorInst(AlgContext &Ctx, SsaInst &Inst) {
   for (unsigned Side = 0; Side < 2; ++Side) {
     if (Inst.Sources[Side].Kind != OperandKind::Immediate ||
         Inst.Sources[Side].Modifier) continue;
-    if (Inst.Sources[Side].Index == 0xffffffffu) {
-      Operand Inner = Inst.Sources[1 - Side];
-      Inst.Opcode = D3D10_SB_OPCODE_NOT;
-      Inst.Sources.assign({Inner});
-      return true;
-    }
     if (Inst.Sources[Side].Index == 1u && TryFoldXorBoolNot(Ctx, Inst, Side))
       return true;
   }
   return false;
 }
 
-uint32_t InvertedCompareOpcode(uint32_t Op, bool AllowFloat) {
+// Table generated from Lean 4 `DXCB5.RewriteRules.invCmpRules`.
+uint32_t InvertedCompareOpcode(uint32_t Op, bool NanSafe, bool Precise) {
   switch (Op) {
-  case D3D10_SB_OPCODE_IEQ: return D3D10_SB_OPCODE_INE;
-  case D3D10_SB_OPCODE_INE: return D3D10_SB_OPCODE_IEQ;
-  case D3D10_SB_OPCODE_ILT: return D3D10_SB_OPCODE_IGE;
-  case D3D10_SB_OPCODE_IGE: return D3D10_SB_OPCODE_ILT;
-  case D3D10_SB_OPCODE_ULT: return D3D10_SB_OPCODE_UGE;
-  case D3D10_SB_OPCODE_UGE: return D3D10_SB_OPCODE_ULT;
-  case D3D10_SB_OPCODE_LT: return AllowFloat ? D3D10_SB_OPCODE_GE : 0u;
-  case D3D10_SB_OPCODE_GE: return AllowFloat ? D3D10_SB_OPCODE_LT : 0u;
-  case D3D10_SB_OPCODE_EQ: return AllowFloat ? D3D10_SB_OPCODE_NE : 0u;
-  case D3D10_SB_OPCODE_NE: return AllowFloat ? D3D10_SB_OPCODE_EQ : 0u;
+#define DXCB5_INV_CMP_RULE(SRC_OP, INV_OP, REQ)                               \
+  case SRC_OP:                                                                \
+    return SatisfiesSemMode(SemModeReq::REQ, NanSafe, Precise) ? INV_OP : 0u;
+#include "Mir/Combine/GeneratedRules.inc"
+#undef DXCB5_INV_CMP_RULE
   default: return 0u;
   }
 }
 
 bool SimplifyNotInst(AlgContext &Ctx, SsaInst &Inst) {
-  if (Inst.Sources[0].Kind != OperandKind::Temp ||
-      Inst.Sources[0].RelativeRegister != UINT32_MAX) return false;
+  if (Inst.Sources[0].Kind != OperandKind::Temp || Inst.Sources[0].RelativeRegister != UINT32_MAX) return false;
   const auto &Def = Ctx.Defs[Inst.Sources[0].Index];
   if (!Def.Valid() || Def.IsPhi || Def.IsAux) return false;
   auto &Prod = Ctx.Ssa.Blocks[Def.Block].Insts[Def.Index];
   if (Prod.Dead) return false;
-  if (Prod.Opcode == D3D10_SB_OPCODE_NOT &&
-      Prod.Sources[0].RelativeRegister == UINT32_MAX) {
+  if (Prod.Opcode == D3D10_SB_OPCODE_NOT && Prod.Sources[0].RelativeRegister == UINT32_MAX) {
     Operand Orig = Prod.Sources[0];
     Orig.Swizzle = ComposeSwizzle(Orig.Swizzle, Inst.Sources[0].Swizzle);
     Inst.Opcode = D3D10_SB_OPCODE_MOV;
@@ -84,13 +72,12 @@ bool SimplifyNotInst(AlgContext &Ctx, SsaInst &Inst) {
     Ctx.BumpUse(Orig);
     return true;
   }
-  if (Ctx.Stats.Count[Inst.Sources[0].Index] != 1 ||
-      Prod.Dest.Mask != Inst.Dest.Mask ||
+  if (Ctx.Stats.Count[Inst.Sources[0].Index] != 1 || Prod.Dest.Mask != Inst.Dest.Mask ||
       (Inst.Sources[0].Swizzle != kIdentitySwizzle &&
        !(PopcountMask(Inst.Dest.Mask) == 1 && Inst.Sources[0].Swizzle == 0)))
     return false;
-  const uint32_t InvOp =
-      InvertedCompareOpcode(Prod.Opcode, !Prod.Precise && !Inst.Precise);
+  const uint32_t InvOp = InvertedCompareOpcode(Prod.Opcode, Ctx.Ssa.NanSafe,
+                                               Prod.Precise || Inst.Precise);
   if (!InvOp) return false;
   Inst.Opcode = InvOp;
   Inst.Sources = Prod.Sources;
@@ -334,17 +321,6 @@ bool SimplifyIaddInst(AlgContext &Ctx, SsaInst &Inst) {
   if (TryFoldInegIntoIadd(Ctx, Inst))
     return true;
   for (unsigned Side = 0; Side < 2; ++Side) {
-    if (Inst.Sources[Side].Kind != OperandKind::Immediate ||
-        Inst.Sources[Side].Index != 0u || Inst.Sources[Side].Modifier)
-      continue;
-    Operand Other = Inst.Sources[1 - Side];
-    if (Other.Modifier)
-      continue;
-    Inst.Opcode = D3D10_SB_OPCODE_MOV;
-    Inst.Sources.assign({Other});
-    return true;
-  }
-  for (unsigned Side = 0; Side < 2; ++Side) {
     const auto &COp = Inst.Sources[Side];
     const auto &POp = Inst.Sources[1 - Side];
     if (COp.Kind != OperandKind::Immediate || COp.Modifier ||
@@ -554,6 +530,7 @@ bool dxcb5::alg::SimplifyIntAndBitInst(AlgContext &Ctx, SsaInst &Inst) {
     if (Inst.Sources.size() == 1 &&
         MatchZextBool(Ctx, Inst.Sources[0], Inner, KnownMask) && KnownMask) {
       Inst.Opcode = D3D10_SB_OPCODE_AND;
+      Inst.Saturate = false;
       Inst.Sources.assign({Inner, MakeImm(kPosOneBits)});
       Ctx.BumpUse(Inner);
       return true;

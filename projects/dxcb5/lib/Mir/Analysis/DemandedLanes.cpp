@@ -1,5 +1,7 @@
 // Distributed under the University of Illinois Open Source License.
+#include "Mir/Analysis/DemandedLanes.h"
 #include "Mir/OptPipeline.h"
+#include "dxcb5/InstructionInfo.h"
 #include "llvm/ADT/SmallVector.h"
 #include <vector>
 
@@ -27,10 +29,16 @@ void MarkOperandLive(const Operand &Op, uint8_t SlotMask, uint32_t NumValues,
 }
 
 bool IsRemovableByDce(const SsaInst &Inst) {
-  return Inst.IsPure() ||
-         (InstructionRequiresQuad(Inst.Opcode) &&
-          Inst.Dest.Kind == OperandKind::Temp &&
-          Inst.AuxDest.Kind == OperandKind::Null);
+  if (Inst.IsPure())
+    return true;
+  if (!InstructionCanEliminateIfDead(Inst.Opcode) ||
+      Inst.Dest.Kind != OperandKind::Temp ||
+      Inst.AuxDest.Kind != OperandKind::Null)
+    return false;
+  for (const auto &Src : Inst.Sources)
+    if (Src.Kind == OperandKind::IndexableTemp || Src.Kind == OperandKind::Uav)
+      return false;
+  return true;
 }
 
 bool SweepDeadInsts(SsaBlock &Block, const std::vector<uint8_t> &LiveLanes) {
@@ -75,10 +83,15 @@ bool SweepDeadInsts(SsaBlock &Block, const std::vector<uint8_t> &LiveLanes) {
       }
       continue;
     }
-    if (!IsPseudoOpcode(Inst.Opcode) &&
-        InstructionIsComponentwise(Inst.Opcode) &&
+    if ((InstructionUsesDemandedDestMask(Inst.Opcode) ||
+         InstructionSupportsNarrowDestMask(Inst.Opcode)) &&
         Inst.Dest.Kind == OperandKind::Temp && PrimaryLive != Inst.Dest.Mask) {
       Inst.Dest.Mask = PrimaryLive;
+      if (GetOpcodeDesc(Inst.Opcode).SlotRule == SourceSlotRule::PerLaneScalar) {
+        for (size_t S = 0; S < Inst.Sources.size(); ++S)
+          if (!(PrimaryLive & (1u << S)))
+            Inst.Sources[S] = MakeImm(0u);
+      }
       Changed = true;
     }
   }
@@ -87,10 +100,11 @@ bool SweepDeadInsts(SsaBlock &Block, const std::vector<uint8_t> &LiveLanes) {
 
 } // namespace
 
-bool dxcb5::RunOptMaskedDce(SsaProgram &Ssa) {
+void dxcb5::ComputeDemandedLanes(const SsaProgram &Ssa,
+                                 std::vector<uint8_t> &Demanded) {
   std::vector<SsaDefSite> Defs;
   Ssa.BuildDefTable(Defs);
-  std::vector<uint8_t> LiveLanes(Ssa.NextValueId, 0);
+  Demanded.assign(Ssa.NextValueId, 0);
   llvm::SmallVector<uint32_t, 256> Worklist;
 
   for (const auto &Block : Ssa.Blocks) {
@@ -101,14 +115,14 @@ bool dxcb5::RunOptMaskedDce(SsaProgram &Ssa) {
                                 ? Inst.AuxDest.Mask
                                 : Inst.Dest.Mask;
       if (Inst.Dest.RelativeRegister != UINT32_MAX)
-        MarkOperandLive(Inst.Dest, 0x1u, Ssa.NextValueId, LiveLanes, Worklist);
+        MarkOperandLive(Inst.Dest, 0x1u, Ssa.NextValueId, Demanded, Worklist);
       for (size_t S = 0; S < Inst.Sources.size(); ++S)
         MarkOperandLive(Inst.Sources[S],
                         InstructionSourceSlotMask(Inst.Opcode, DMask, S),
-                        Ssa.NextValueId, LiveLanes, Worklist);
+                        Ssa.NextValueId, Demanded, Worklist);
     }
     if (Block.Kind == FlowKind::Branch || Block.Kind == FlowKind::Switch)
-      MarkOperandLive(Block.Condition, 0x1u, Ssa.NextValueId, LiveLanes,
+      MarkOperandLive(Block.Condition, 0x1u, Ssa.NextValueId, Demanded,
                       Worklist);
   }
 
@@ -117,37 +131,38 @@ bool dxcb5::RunOptMaskedDce(SsaProgram &Ssa) {
     const auto &Def = Defs[Id];
     if (!Def.Valid())
       continue;
-    const uint8_t Need = LiveLanes[Id];
+    const uint8_t Need = Demanded[Id];
     if (Def.IsPhi) {
       const auto &Phi = Ssa.Blocks[Def.Block].Phis[Def.Index];
       if (Phi.Dead)
         continue;
       const uint8_t Active = static_cast<uint8_t>(Phi.Mask & Need);
       for (const auto &In : Phi.Inputs)
-        MarkOperandLive(In.Value, Active, Ssa.NextValueId, LiveLanes, Worklist);
+        MarkOperandLive(In.Value, Active, Ssa.NextValueId, Demanded, Worklist);
       continue;
     }
     const auto &Inst = Ssa.Blocks[Def.Block].Insts[Def.Index];
     if (Inst.Dead || !IsRemovableByDce(Inst))
       continue;
-    if (Inst.Opcode == PseudoCombineVec) {
-      for (unsigned L = 0; L < Inst.Sources.size(); ++L)
-        if (Need & (1u << L))
-          MarkOperandLive(Inst.Sources[L], 0x1u, Ssa.NextValueId, LiveLanes,
-                          Worklist);
-      continue;
-    }
-    const uint8_t DMask = InstructionIsComponentwise(Inst.Opcode)
+    const uint8_t DMask = InstructionUsesDemandedDestMask(Inst.Opcode)
                               ? static_cast<uint8_t>(Inst.Dest.Mask & Need)
                               : (Def.IsAux ? Inst.AuxDest.Mask : Inst.Dest.Mask);
-    for (size_t S = 0; S < Inst.Sources.size(); ++S)
-      MarkOperandLive(Inst.Sources[S],
-                      InstructionSourceSlotMask(Inst.Opcode, DMask, S),
-                      Ssa.NextValueId, LiveLanes, Worklist);
+    for (size_t S = 0; S < Inst.Sources.size(); ++S) {
+      const uint8_t SlotMask = InstructionSourceSlotMask(Inst.Opcode, DMask, S);
+      if (SlotMask)
+        MarkOperandLive(Inst.Sources[S], SlotMask, Ssa.NextValueId, Demanded,
+                        Worklist);
+    }
   }
+}
 
+bool dxcb5::RunOptMaskedDce(SsaProgram &Ssa) {
+  std::vector<uint8_t> LiveLanes;
+  ComputeDemandedLanes(Ssa, LiveLanes);
   bool Changed = false;
   for (auto &Block : Ssa.Blocks)
     Changed |= SweepDeadInsts(Block, LiveLanes);
+  if (Changed)
+    Ssa.CompactDead();
   return Changed;
 }

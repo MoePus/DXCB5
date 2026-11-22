@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 #include "llvm/ADT/SmallVector.h"
 #include <array>
 
@@ -139,23 +139,40 @@ bool IsPowAbsZeroAtZero(const AlgContext &Ctx, const Operand &YVal,
 }
 
 bool TryCollapseSignCbrtMovc(AlgContext &Ctx, SsaInst &Inst) {
-  if (Inst.Precise || Inst.Sources[0].Kind != OperandKind::Temp ||
+  if (Inst.Precise || Ctx.Ssa.NanSafe ||
+      Inst.Sources[0].Kind != OperandKind::Temp ||
       Inst.Sources[0].Modifier ||
-      Inst.Sources[0].RelativeRegister != UINT32_MAX ||
-      Inst.Sources[2].Kind != OperandKind::Temp || Inst.Sources[2].Modifier ||
+      Inst.Sources[0].RelativeRegister != UINT32_MAX)
+    return false;
+  const auto &PD = Ctx.Defs[Inst.Sources[0].Index];
+  if (!PD.Valid() || PD.IsPhi || PD.IsAux)
+    return false;
+  const auto &PosCmp = Ctx.Ssa.Blocks[PD.Block].Insts[PD.Index];
+  if (PosCmp.Dead || PosCmp.Opcode != D3D10_SB_OPCODE_LT ||
+      PosCmp.Dest.Mask != Inst.Dest.Mask || !IsZeroFloatImm(PosCmp.Sources[0]) ||
+      !IsIdentitySwizzle(Inst.Sources[0].Swizzle, Inst.Dest.Mask))
+    return false;
+  const Operand &XVal = PosCmp.Sources[1];
+  const Operand &YVal = Inst.Sources[1];
+  // When X >= 0 is proven, movc(0 < X, exp(log(|X|) * k), 0) == Y everywhere
+  // (at X == 0, exp(-inf * k) == 0 for k > 0).
+  if (IsZeroFloatImm(Inst.Sources[2]) &&
+      IsKnownNonNegativeFloat(Ctx, XVal, Inst.Dest.Mask, /*AllowNegZero=*/true) &&
+      IsPowAbsZeroAtZero(Ctx, YVal, XVal)) {
+    Operand Keep = YVal;
+    Inst.Opcode = D3D10_SB_OPCODE_MOV;
+    Inst.Sources.assign({Keep});
+    return true;
+  }
+  if (Inst.Sources[2].Kind != OperandKind::Temp || Inst.Sources[2].Modifier ||
       Inst.Sources[2].RelativeRegister != UINT32_MAX ||
       Ctx.Stats.Count[Inst.Sources[2].Index] != 1)
     return false;
-  const auto &PD = Ctx.Defs[Inst.Sources[0].Index];
   const auto &SD = Ctx.Defs[Inst.Sources[2].Index];
-  if (!PD.Valid() || PD.IsPhi || PD.IsAux || !SD.Valid() || SD.IsPhi ||
-      SD.IsAux)
+  if (!SD.Valid() || SD.IsPhi || SD.IsAux)
     return false;
-  const auto &PosCmp = Ctx.Ssa.Blocks[PD.Block].Insts[PD.Index];
   auto &SubSel = Ctx.Ssa.Blocks[SD.Block].Insts[SD.Index];
-  if (PosCmp.Dead || PosCmp.Opcode != D3D10_SB_OPCODE_LT ||
-      PosCmp.Dest.Mask != Inst.Dest.Mask || !IsZeroFloatImm(PosCmp.Sources[0]) ||
-      SubSel.Dead || SubSel.Opcode != D3D10_SB_OPCODE_MOVC || SubSel.Saturate ||
+  if (SubSel.Dead || SubSel.Opcode != D3D10_SB_OPCODE_MOVC || SubSel.Saturate ||
       SubSel.Dest.Mask != Inst.Dest.Mask || !IsZeroFloatImm(SubSel.Sources[2]) ||
       SubSel.Sources[0].Kind != OperandKind::Temp ||
       SubSel.Sources[0].Modifier ||
@@ -165,10 +182,7 @@ bool TryCollapseSignCbrtMovc(AlgContext &Ctx, SsaInst &Inst) {
   if (!ND.Valid() || ND.IsPhi || ND.IsAux)
     return false;
   const auto &NegCmp = Ctx.Ssa.Blocks[ND.Block].Insts[ND.Index];
-  const Operand &XVal = PosCmp.Sources[1];
-  const Operand &YVal = Inst.Sources[1];
-  if (!IsIdentitySwizzle(Inst.Sources[0].Swizzle, Inst.Dest.Mask) ||
-      !IsIdentitySwizzle(Inst.Sources[2].Swizzle, Inst.Dest.Mask) ||
+  if (!IsIdentitySwizzle(Inst.Sources[2].Swizzle, Inst.Dest.Mask) ||
       !IsIdentitySwizzle(SubSel.Sources[0].Swizzle, Inst.Dest.Mask) ||
       NegCmp.Dead || NegCmp.Opcode != D3D10_SB_OPCODE_LT ||
       NegCmp.Dest.Mask != Inst.Dest.Mask || !IsZeroFloatImm(NegCmp.Sources[1]) ||
@@ -194,30 +208,23 @@ bool TryFoldMovcToMinMax(const AlgContext &Ctx, SsaInst &Inst) {
       (Inst.Sources[0].Swizzle != kIdentitySwizzle &&
        !(PopcountMask(Inst.Dest.Mask) == 1 && Inst.Sources[0].Swizzle == 0)))
     return false;
+  // Table generated from Lean 4 `DXCB5.RewriteRules.movcMinMaxRules`.
   uint32_t DirectOp = 0, SwappedOp = 0;
-  // SM5 min/max returns the non-NaN operand, whereas MOVC(LT/GE, T, F) returns
-  // F on NaN; under --nan-safe, folding requires F to be provably non-NaN.
-  const bool FloatOk =
-      !Inst.Precise && !Cmp.Precise &&
-      (!Ctx.Ssa.NanSafe ||
-       IsKnownNonNaNFloat(Ctx, Inst.Sources[2], Inst.Dest.Mask));
+  const bool AnyPrecise = Inst.Precise || Cmp.Precise;
+  const bool NonNaNF =
+      !Ctx.Ssa.NanSafe || IsKnownNonNaNFloat(Ctx, Inst.Sources[2], Inst.Dest.Mask);
   switch (Cmp.Opcode) {
-  case D3D10_SB_OPCODE_LT:
-    if (FloatOk) {
-      DirectOp = D3D10_SB_OPCODE_MIN;
-      SwappedOp = D3D10_SB_OPCODE_MAX;
-    }
+#define DXCB5_MOVC_MINMAX_RULE(CMP_OP, DIR_OP, SWP_OP, IS_FLT, REQ)           \
+  case CMP_OP:                                                                \
+    if ((IS_FLT || !Inst.Saturate) &&                                         \
+        SatisfiesSemMode(SemModeReq::REQ, Ctx.Ssa.NanSafe, AnyPrecise,        \
+                         NonNaNF)) {                                          \
+      DirectOp = DIR_OP;                                                      \
+      SwappedOp = SWP_OP;                                                     \
+    }                                                                         \
     break;
-  case D3D10_SB_OPCODE_GE:
-    if (FloatOk) {
-      DirectOp = D3D10_SB_OPCODE_MAX;
-      SwappedOp = D3D10_SB_OPCODE_MIN;
-    }
-    break;
-  case D3D10_SB_OPCODE_ILT: DirectOp = D3D10_SB_OPCODE_IMIN; SwappedOp = D3D10_SB_OPCODE_IMAX; break;
-  case D3D10_SB_OPCODE_IGE: DirectOp = D3D10_SB_OPCODE_IMAX; SwappedOp = D3D10_SB_OPCODE_IMIN; break;
-  case D3D10_SB_OPCODE_ULT: DirectOp = D3D10_SB_OPCODE_UMIN; SwappedOp = D3D10_SB_OPCODE_UMAX; break;
-  case D3D10_SB_OPCODE_UGE: DirectOp = D3D10_SB_OPCODE_UMAX; SwappedOp = D3D10_SB_OPCODE_UMIN; break;
+#include "Mir/Combine/GeneratedRules.inc"
+#undef DXCB5_MOVC_MINMAX_RULE
   default: return false;
   }
   if (!DirectOp)

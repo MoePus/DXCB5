@@ -1,0 +1,29 @@
+// Distributed under the University of Illinois Open Source License.
+// Single Source of Truth for all DXCB5 SSA MIR pass identifiers and CLI names.
+// Format: DXCB5_PASS(EnumName, CliName, Disableable)
+#ifndef DXCB5_PASS
+#error "Define DXCB5_PASS(EnumName, CliName, Disableable) before including Passes.def"
+#endif
+
+DXCB5_PASS(IndexableCopy,  "indexable-copy",  1)
+DXCB5_PASS(IndexableSsa,   "indexable-ssa",   1)
+DXCB5_PASS(IndexableTemps, "indexable-temps", 1)
+DXCB5_PASS(Copies,         "copies",          1)
+DXCB5_PASS(LaneConst,      "lane-const",      1)
+DXCB5_PASS(CfgCleanup,     "cfg-cleanup",     0)
+DXCB5_PASS(IfConvert,      "if-convert",      1)
+DXCB5_PASS(Gvn,            "gvn",             1)
+DXCB5_PASS(MaskedDce,      "masked-dce",      1)
+DXCB5_PASS(Dots,           "dots",            1)
+DXCB5_PASS(Algebraic,      "algebraic",       1)
+DXCB5_PASS(Slp,            "slp",             1)
+DXCB5_PASS(IndexablePack,  "indexable-pack",  1)
+DXCB5_PASS(Dp2,            "dp2",             1)
+DXCB5_PASS(LoopPeel,       "loop-peel",       1)
+DXCB5_PASS(GuardDiscard,   "guard-discard",   1)
+DXCB5_PASS(Licm,           "licm",            1)
+DXCB5_PASS(ColdSink,       "cold-sink",       1)
+DXCB5_PASS(FoldOutputs,    "fold-outputs",    1)
+DXCB5_PASS(PressureShrink, "pressure-shrink", 1)
+
+#undef DXCB5_PASS

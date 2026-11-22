@@ -46,10 +46,10 @@ public:
   SsaBlock *CurrentBlock = nullptr;
   llvm::DenseMap<const llvm::BasicBlock *, uint32_t> BlockIDs;
   llvm::DenseMap<const llvm::Value *, Operand> Values;
-  llvm::DenseMap<const llvm::AllocaInst *, uint32_t> LocalArrays;
   llvm::DenseMap<const llvm::AllocaInst *, uint32_t> IndexableArrays;
   llvm::DenseMap<const llvm::GlobalVariable *, uint32_t> IndexableGlobals;
-  llvm::DenseMap<const llvm::GlobalVariable *, uint32_t> LocalConstants;
+  llvm::DenseMap<std::pair<const llvm::GlobalVariable *, unsigned>, uint32_t>
+      LocalConstants;
   llvm::DenseMap<const hlsl::DxilResourceBase *, std::vector<uint32_t>>
       UsedResourceSlots;
   LocalConstantPlan ConstantTuples;

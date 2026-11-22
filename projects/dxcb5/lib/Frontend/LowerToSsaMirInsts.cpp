@@ -1,5 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
 #include "Frontend/LowerToSsaMir.h"
+#include "dxc/HLSL/Dxcb5Contract.h"
 #include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
@@ -77,65 +78,13 @@ bool IsZeroFloatConst(const Value *V, bool AllowPositiveZero) {
   return true;
 }
 
-bool IsInvertedFloatPredicate(CmpInst::Predicate P) {
-  switch (P) {
-  case CmpInst::FCMP_UGE:
-  case CmpInst::FCMP_ULE:
-  case CmpInst::FCMP_UGT:
-  case CmpInst::FCMP_ULT:
-  case CmpInst::FCMP_UNO:
-  case CmpInst::FCMP_UEQ: return true;
-  default: return false;
-  }
-}
-
-bool IsFoldedInvertedBool(const Value *V) {
-  const auto *Cmp = dyn_cast<FCmpInst>(V);
-  if (!Cmp || !Cmp->getType()->isIntegerTy(1) ||
-      !IsInvertedFloatPredicate(Cmp->getPredicate()) || Cmp->use_empty())
-    return false;
-  for (const auto &Use : Cmp->uses()) {
-    const auto *U = Use.getUser();
-    if (const auto *Br = dyn_cast<BranchInst>(U)) {
-      if (!Br->isConditional() || Use.getOperandNo() != 0)
-        return false;
-      continue;
-    }
-    if (isa<SelectInst>(U) && Use.getOperandNo() == 0)
-      continue;
-    return false;
-  }
-  return true;
-}
-
-const Value *DirectBranchCondition(const CmpInst &Cmp, bool &Invert) {
-  if ((Cmp.getPredicate() != CmpInst::ICMP_EQ &&
-       Cmp.getPredicate() != CmpInst::ICMP_NE) ||
-      !Cmp.hasOneUse())
-    return nullptr;
-  const auto *Branch = dyn_cast<BranchInst>(*Cmp.user_begin());
-  if (!Branch || !Branch->isConditional())
-    return nullptr;
-  const auto *Ty = Cmp.getOperand(0)->getType();
-  if (!Ty->isIntegerTy(32) && !Ty->isIntegerTy(1))
-    return nullptr;
-  for (unsigned Side = 0; Side < 2; ++Side) {
-    const auto *Zero = dyn_cast<ConstantInt>(Cmp.getOperand(Side));
-    if (Zero && Zero->isZero()) {
-      Invert = Cmp.getPredicate() == CmpInst::ICMP_EQ;
-      return Cmp.getOperand(1 - Side);
-    }
-  }
-  return nullptr;
-}
-
 bool EmitOrderedUnorderedCompare(SsaLowerer &L, CmpInst::Predicate Pred,
                                  Operand Left, Operand Right, Operand Dest,
-                                 bool Precise, bool ElideNot) {
+                                 bool Precise) {
   const auto First = L.AllocTemp(Dest.Mask);
   const auto Second = L.AllocTemp(Dest.Mask);
   const bool NeedsNot =
-      (Pred == CmpInst::FCMP_UNO || Pred == CmpInst::FCMP_UEQ) && !ElideNot;
+      (Pred == CmpInst::FCMP_UNO || Pred == CmpInst::FCMP_UEQ);
   const auto Mid = NeedsNot ? L.AllocTemp(Dest.Mask) : Dest;
   if (Pred == CmpInst::FCMP_ORD || Pred == CmpInst::FCMP_UNO) {
     L.Emit(D3D10_SB_OPCODE_EQ, First, {Left, Left}, Precise);
@@ -155,7 +104,6 @@ bool EmitFloatCompare(SsaLowerer &L, const CmpInst &Inst, Operand Left,
                       Operand Right, Operand Dest) {
   const auto Pred = Inst.getPredicate();
   const bool Precise = L.Module.IsPrecise(&Inst);
-  const bool ElideNot = IsFoldedInvertedBool(&Inst);
   unsigned Opcode = 0;
   bool Invert = false;
   switch (Pred) {
@@ -176,10 +124,9 @@ bool EmitFloatCompare(SsaLowerer &L, const CmpInst &Inst, Operand Left,
   case CmpInst::FCMP_UGT: std::swap(Left, Right); LLVM_FALLTHROUGH;
   case CmpInst::FCMP_ULT: Opcode = D3D10_SB_OPCODE_GE; Invert = true; break;
   default:
-    return EmitOrderedUnorderedCompare(L, Pred, Left, Right, Dest, Precise,
-                                       ElideNot);
+    return EmitOrderedUnorderedCompare(L, Pred, Left, Right, Dest, Precise);
   }
-  if (Invert && !ElideNot) {
+  if (Invert) {
     const auto Mid = L.AllocTemp(Dest.Mask);
     L.Emit(Opcode, Mid, {Left, Right}, Precise);
     L.Emit(D3D10_SB_OPCODE_NOT, Dest, {Mid}, Precise);
@@ -221,7 +168,7 @@ bool LowerExtractElement(SsaLowerer &L, ExtractElementInst &EE, bool Precise) {
   if (isa<ConstantInt>(EE.getIndexOperand()))
     return true;
   const unsigned W = ValueWidth(EE.getVectorOperand()->getType());
-  const auto Selector = L.Source(EE.getIndexOperand());
+  const auto Selector = L.SourceInt(EE.getIndexOperand(), false, Precise);
   const auto Dest = L.Values.lookup(&EE);
   auto Cur = L.AllocTemp(1);
   L.Emit(D3D10_SB_OPCODE_MOV, Cur, {L.SourceScalarLane(EE.getVectorOperand(), 0)},
@@ -332,6 +279,21 @@ bool LowerBinaryInst(SsaLowerer &L, llvm::Instruction &Inst, unsigned BinOp,
 } // namespace
 
 bool SsaLowerer::LowerInstruction(llvm::Instruction &Inst) {
+  const bool FastMath =
+      Inst.getMetadata(llvm::dxcb5_contract::kFastMathMD) != nullptr;
+  const size_t StartIdx = CurrentBlock->Insts.size();
+  struct FastMathTagGuard {
+    SsaBlock *Blk;
+    size_t Start;
+    bool Enable;
+    ~FastMathTagGuard() {
+      if (!Enable)
+        return;
+      for (size_t K = Start; K < Blk->Insts.size(); ++K)
+        Blk->Insts[K].FastMath = true;
+    }
+  } Guard{CurrentBlock, StartIdx, FastMath};
+
   if (auto *Call = dyn_cast<CallInst>(&Inst))
     return LowerCall(*Call);
   if (auto *Alloca = dyn_cast<AllocaInst>(&Inst))
@@ -367,18 +329,12 @@ bool SsaLowerer::LowerInstruction(llvm::Instruction &Inst) {
   }
 
   const auto Dest = Values.lookup(&Inst);
-  if (auto *Cmp = dyn_cast<CmpInst>(&Inst)) {
-    bool Invert = false;
-    if (DirectBranchCondition(*Cmp, Invert))
-      return true;
+  if (auto *Cmp = dyn_cast<CmpInst>(&Inst))
     return EmitCompare(*this, *Cmp, Dest);
-  }
   if (auto *Sel = dyn_cast<SelectInst>(&Inst)) {
-    const bool Inverted = IsFoldedInvertedBool(Sel->getCondition());
     Emit(D3D10_SB_OPCODE_MOVC, Dest,
-         {Source(Sel->getCondition()),
-          Source(Inverted ? Sel->getFalseValue() : Sel->getTrueValue()),
-          Source(Inverted ? Sel->getTrueValue() : Sel->getFalseValue())},
+         {Source(Sel->getCondition()), Source(Sel->getTrueValue()),
+          Source(Sel->getFalseValue())},
          Precise);
     return Error.empty();
   }
@@ -415,8 +371,12 @@ bool SsaLowerer::LowerInstruction(llvm::Instruction &Inst) {
     return Error.empty();
   }
   if (Inst.getOpcode() == I::BitCast) {
-    const Type *STy = Inst.getOperand(0)->getType()->getScalarType();
-    const Type *DTy = Inst.getType()->getScalarType();
+    const Type *SrcFullTy = Inst.getOperand(0)->getType();
+    const Type *DstFullTy = Inst.getType();
+    if (ValueWidth(SrcFullTy) != ValueWidth(DstFullTy))
+      return Fail("unsupported width-changing bitcast in SM5");
+    const Type *STy = SrcFullTy->getScalarType();
+    const Type *DTy = DstFullTy->getScalarType();
     if (STy->isHalfTy() && DTy->isIntegerTy(16))
       return Emit(D3D11_SB_OPCODE_F32TOF16, Dest, {Source(Inst.getOperand(0))},
                   Precise), Error.empty();
@@ -424,6 +384,8 @@ bool SsaLowerer::LowerInstruction(llvm::Instruction &Inst) {
       return Emit(D3D11_SB_OPCODE_F16TOF32, Dest,
                   {SourceInt(Inst.getOperand(0), false, Precise)}, Precise),
              Error.empty();
+    if (STy->getPrimitiveSizeInBits() != DTy->getPrimitiveSizeInBits())
+      return Fail("unsupported width-changing scalar bitcast in SM5");
   }
   if (const unsigned CastOp = CastOpcode(Inst.getOpcode());
       CastOp != kUnsupportedOpcode) {
@@ -447,24 +409,25 @@ bool SsaLowerer::LowerTerminator(BasicBlock &Block, SsaBlock &Out) {
   }
   if (auto *Branch = dyn_cast<BranchInst>(Term)) {
     Out.Kind = Branch->isConditional() ? FlowKind::Branch : FlowKind::Jump;
-    bool Invert = false;
-    if (Branch->isConditional()) {
-      const Value *Cond = Branch->getCondition();
-      if (const auto *Cmp = dyn_cast<CmpInst>(Cond))
-        if (const auto *Direct = DirectBranchCondition(*Cmp, Invert))
-          Cond = Direct;
-      if (IsFoldedInvertedBool(Cond))
-        Invert = !Invert;
-      Out.Condition = Source(Cond);
-    }
+    Out.StrictBranch =
+        Branch->isConditional() &&
+        Branch->getMetadata(llvm::dxcb5_contract::kStrictBranchMD) != nullptr;
+    Out.UniformBranch =
+        Branch->isConditional() &&
+        Branch->getMetadata(llvm::dxcb5_contract::kUniformMD) != nullptr;
+    if (Branch->isConditional())
+      Out.Condition = Source(Branch->getCondition());
     for (unsigned Idx = 0; Idx < Branch->getNumSuccessors(); ++Idx)
-      Out.Successors.push_back(
-          BlockIDs.lookup(Branch->getSuccessor(Invert ? 1 - Idx : Idx)));
+      Out.Successors.push_back(BlockIDs.lookup(Branch->getSuccessor(Idx)));
     return Error.empty();
   }
   if (auto *Switch = dyn_cast<SwitchInst>(Term)) {
     Out.Kind = FlowKind::Switch;
-    Out.Condition = Source(Switch->getCondition());
+    Out.StrictBranch =
+        Switch->getMetadata(llvm::dxcb5_contract::kStrictBranchMD) != nullptr;
+    Out.UniformBranch =
+        Switch->getMetadata(llvm::dxcb5_contract::kUniformMD) != nullptr;
+    Out.Condition = SourceInt(Switch->getCondition(), false, false);
     Out.Successors.push_back(BlockIDs.lookup(Switch->getDefaultDest()));
     Out.CaseValues.push_back(0);
     for (auto Case : Switch->cases()) {

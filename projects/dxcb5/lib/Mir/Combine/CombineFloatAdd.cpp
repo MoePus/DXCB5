@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 
 using namespace dxcb5;
 using namespace dxcb5::alg;
@@ -119,55 +119,79 @@ bool TryFoldAddIntoMadChainBase(AlgContext &Ctx, uint32_t B, SsaInst &Inst) {
   return false;
 }
 
-bool IsKnownNonNegativeFloat(const AlgContext &Ctx, const Operand &Op,
-                             uint8_t Mask, bool AllowNegZero) {
-  if (Op.Modifier == D3D10_SB_OPERAND_MODIFIER_ABS)
-    return true;
-  if (Op.Modifier != 0 || Op.RelativeRegister != UINT32_MAX)
+bool TryEmitFastCbrt(AlgContext &Ctx, uint32_t B, uint32_t &I, SsaInst &Mul,
+                     SsaInst &Log, Operand X) {
+  auto &Inst = Ctx.Ssa.Blocks[B].Insts[I];
+  if (X.RelativeRegister != UINT32_MAX ||
+      X.Kind == OperandKind::ImmediateVector)
     return false;
-  if (Op.Kind == OperandKind::Immediate) {
-    const float F = BitsToFloat(Op.Index);
-    if (std::isnan(F))
-      return false;
-    return F > 0.0f || Op.Index == kPosZeroBits ||
-           (AllowNegZero && Op.Index == kNegZeroBits);
+  const uint8_t M = Inst.Dest.Mask;
+  const uint8_t Swz = PopcountMask(M) == 1
+                          ? BroadcastLaneSwizzle(FirstActiveLane(M))
+                          : kIdentitySwizzle;
+  auto MakeTmp = [&]() { return MakeSsaTemp(Ctx.Ssa.AllocValue(), M, Swz); };
+  llvm::SmallVector<SsaInst, 10> Ins;
+  auto AddOp = [&](uint32_t Opc, Operand Dst,
+                   std::initializer_list<Operand> Srcs, bool Sat = false) {
+    SsaInst S;
+    S.Opcode = Opc;
+    S.Dest = Dst;
+    S.Sources.append(Srcs.begin(), Srcs.end());
+    S.Saturate = Sat;
+    Ins.push_back(std::move(S));
+  };
+  Operand XPos = X;
+  if (X.Modifier != 0) {
+    XPos = MakeTmp();
+    AddOp(D3D10_SB_OPCODE_MOV, XPos, {X});
   }
-  if (Op.Kind != OperandKind::Temp)
-    return false;
-  const auto &D = Ctx.Defs[Op.Index];
-  if (!D.Valid() || D.IsPhi || D.IsAux)
-    return false;
-  const auto &P = Ctx.Ssa.Blocks[D.Block].Insts[D.Index];
-  if (P.Dead)
-    return false;
-  for (unsigned L = 0; L < kRegisterLanes; ++L)
-    if ((Mask & (1u << L)) &&
-        !(P.Dest.Mask & (1u << GetSwizzleLane(Op.Swizzle, L))))
-      return false;
-  if (P.Saturate || P.Opcode == D3D10_SB_OPCODE_EXP)
-    return true;
-  if (P.Opcode == D3D10_SB_OPCODE_SQRT)
-    return AllowNegZero;
-  if ((P.Opcode == D3D10_SB_OPCODE_MUL || P.Opcode == D3D10_SB_OPCODE_DP2 ||
-       P.Opcode == D3D10_SB_OPCODE_DP3 || P.Opcode == D3D10_SB_OPCODE_DP4) &&
-      P.Sources.size() == 2 && EqualCopySources(P.Sources[0], P.Sources[1]))
-    return true;
-  if (P.Opcode == D3D10_SB_OPCODE_MAX && P.Sources.size() == 2) {
-    for (unsigned K = 0; K < 2; ++K) {
-      if (P.Sources[K].Kind != OperandKind::Immediate || P.Sources[K].Modifier)
-        continue;
-      const float F = BitsToFloat(P.Sources[K].Index);
-      if (F > 0.0f || (AllowNegZero && F == 0.0f))
-        return true;
-    }
+  const Operand Hi = MakeTmp();
+  {
+    SsaInst Umul;
+    Umul.Opcode = D3D10_SB_OPCODE_UMUL;
+    Umul.Dest = Hi;
+    Umul.AuxDest = Operand{OperandKind::Null};
+    Umul.Sources = {XPos, MakeImm(0x55555556u)};
+    Ins.push_back(std::move(Umul));
   }
-  return false;
+  const Operand Y0 = MakeTmp();
+  AddOp(D3D10_SB_OPCODE_IADD, Y0, {Hi, MakeImm(0x2a512000u)});
+  const Operand Y2 = MakeTmp();
+  AddOp(D3D10_SB_OPCODE_MUL, Y2, {Y0, Y0});
+  const Operand RcpY2 = MakeTmp();
+  AddOp(D3D11_SB_OPCODE_RCP, RcpY2, {Y2});
+  const Operand XR = MakeTmp();
+  AddOp(D3D10_SB_OPCODE_MUL, XR, {XPos, RcpY2});
+  const Operand XR3 = MakeTmp();
+  AddOp(D3D10_SB_OPCODE_MUL, XR3, {XR, MakeImm(FloatToBits(1.0f / 3.0f))});
+  const Operand Y1 = MakeTmp();
+  AddOp(D3D10_SB_OPCODE_MAD, Y1,
+        {Y0, MakeImm(FloatToBits(2.0f / 3.0f)), XR3}, Inst.Saturate);
+  const Operand IsZero = MakeTmp();
+  AddOp(D3D10_SB_OPCODE_EQ, IsZero, {XPos, MakeImm(kPosZeroBits)});
+
+  Inst.Opcode = D3D10_SB_OPCODE_MOVC;
+  Inst.Saturate = false;
+  Inst.Sources.assign({IsZero, MakeImm(kPosZeroBits), Y1});
+  Mul.Dead = true;
+  Log.Dead = true;
+
+  const uint32_t OrigI = I;
+  auto &Insts = Ctx.Ssa.Blocks[B].Insts;
+  Insts.insert(Insts.begin() + I, Ins.begin(), Ins.end());
+  I += static_cast<uint32_t>(Ins.size());
+  Ctx.RefreshBlockAfterInsert(B, OrigI);
+  Ctx.BumpUse(X);
+  return true;
 }
 
-bool TryFoldPowConst(const AlgContext &Ctx, SsaInst &Inst, SsaInst &Mul,
+bool TryFoldPowConst(AlgContext &Ctx, uint32_t B, uint32_t &I, SsaInst &Mul,
                      SsaInst &Log, const Operand &LOp, float ExpC) {
+  auto &Inst = Ctx.Ssa.Blocks[B].Insts[I];
   const Operand X = Log.Sources[0];
-  const bool AllowNegZero = (ExpC == 2.0f || ExpC == 4.0f);
+  const bool IsFastCbrt =
+      Inst.FastMath && std::fabs(ExpC - (1.0f / 3.0f)) < 1e-6f;
+  const bool AllowNegZero = (ExpC == 2.0f || ExpC == 4.0f || IsFastCbrt);
   if (!IsKnownNonNegativeFloat(Ctx, X, Inst.Dest.Mask, AllowNegZero))
     return false;
   if (ExpC == 0.5f || ExpC == -0.5f || ExpC == -1.0f || ExpC == 1.0f ||
@@ -201,6 +225,18 @@ bool TryFoldPowConst(const AlgContext &Ctx, SsaInst &Inst, SsaInst &Mul,
     Mul.Dead = true;
     return true;
   }
+  if (ExpC == 0.125f) {
+    const Operand MOp = Inst.Sources[0];
+    Log.Opcode = D3D10_SB_OPCODE_SQRT;
+    Log.Sources.assign({X});
+    Mul.Opcode = D3D10_SB_OPCODE_SQRT;
+    Mul.Sources.assign({LOp});
+    Inst.Opcode = D3D10_SB_OPCODE_SQRT;
+    Inst.Sources.assign({MOp});
+    return true;
+  }
+  if (IsFastCbrt)
+    return TryEmitFastCbrt(Ctx, B, I, Mul, Log, X);
   return false;
 }
 
@@ -289,7 +325,7 @@ bool dxcb5::alg::SimplifyMadInst(AlgContext &Ctx, SsaInst &Inst) {
   if (Inst.Precise)
     return Changed;
   for (unsigned Side = 0; Side < 2; ++Side) {
-    if (IsZeroFloatImm(Inst.Sources[Side])) {
+    if (!Ctx.Ssa.NanSafe && IsZeroFloatImm(Inst.Sources[Side])) {
       Operand Addend = Inst.Sources[2];
       Inst.Opcode = D3D10_SB_OPCODE_MOV;
       Inst.Sources.assign({Addend});
@@ -432,7 +468,8 @@ bool dxcb5::alg::SimplifyMinMaxInst(AlgContext &Ctx, SsaInst &Inst) {
   return false;
 }
 
-bool dxcb5::alg::SimplifyExpInst(AlgContext &Ctx, SsaInst &Inst) {
+bool dxcb5::alg::SimplifyExpInst(AlgContext &Ctx, uint32_t B, uint32_t &I) {
+  auto &Inst = Ctx.Ssa.Blocks[B].Insts[I];
   if (Inst.Precise || Inst.Sources.size() != 1 ||
       Inst.Sources[0].Kind != OperandKind::Temp || Inst.Sources[0].Modifier ||
       Inst.Sources[0].RelativeRegister != UINT32_MAX ||
@@ -461,7 +498,7 @@ bool dxcb5::alg::SimplifyExpInst(AlgContext &Ctx, SsaInst &Inst) {
         Log.Saturate || Log.Dest.Mask != Inst.Dest.Mask ||
         !IsIdentitySwizzle(LOp.Swizzle, Inst.Dest.Mask))
       continue;
-    if (TryFoldPowConst(Ctx, Inst, Mul, Log, LOp, BitsToFloat(COp.Index)))
+    if (TryFoldPowConst(Ctx, B, I, Mul, Log, LOp, BitsToFloat(COp.Index)))
       return true;
   }
   return false;

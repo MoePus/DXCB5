@@ -151,6 +151,7 @@ bool MatchIfConvShape(const SsaProgram &Ssa, uint32_t H,
                       IfConvShape &S) {
   const auto &Head = Ssa.Blocks[H];
   if (Head.Kind != FlowKind::Branch || Head.Successors.size() != 2 ||
+      Head.StrictBranch ||
       Head.Condition.Kind == OperandKind::Null ||
       Head.Condition.Modifier != 0 ||
       Head.Condition.RelativeRegister != UINT32_MAX)
@@ -283,6 +284,8 @@ void MergeSoleSuccessorJoin(SsaProgram &Ssa, uint32_t H, uint32_t Join) {
   Head.Condition = JoinBlk.Condition;
   Head.Successors = JoinBlk.Successors;
   Head.CaseValues = JoinBlk.CaseValues;
+  Head.StrictBranch = JoinBlk.StrictBranch;
+  Head.UniformBranch = JoinBlk.UniformBranch;
   for (uint32_t Succ : Head.Successors) {
     if (Succ >= Ssa.Blocks.size())
       continue;
@@ -482,7 +485,7 @@ bool MergeTrivialJumps(SsaProgram &Ssa,
 
 bool RunIfConvertPass(SsaProgram &Ssa,
                       std::vector<llvm::SmallVector<uint32_t, 4>> &Preds) {
-  bool PassChanged = MergeTrivialJumps(Ssa, Preds);
+  bool PassChanged = false;
   for (uint32_t H = 0; H < Ssa.Blocks.size(); ++H) {
     bool MergedJoin = false;
     while (TryIfConvertBlock(Ssa, H, Preds, MergedJoin)) {
@@ -496,14 +499,40 @@ bool RunIfConvertPass(SsaProgram &Ssa,
 
 } // namespace
 
-bool dxcb5::RunOptIfConvert(SsaProgram &Ssa) {
-  llvm::TimeTraceScope Scope("DXCB5 Opt If-Convert", llvm::StringRef());
+bool dxcb5::RunOptCfgCleanup(SsaProgram &Ssa) {
+  llvm::TimeTraceScope Scope("DXCB5 Opt CFG Cleanup", llvm::StringRef());
   bool AnyChanged = TryFoldConstantBranches(Ssa);
+  if (Ssa.Blocks.size() >= 2) {
+    SsaDomTree Dom;
+    Ssa.ComputeDominators(Dom);
+    if (Dom.RpoOrder.size() < Ssa.Blocks.size()) {
+      CompactReachableBlocks(Ssa);
+      AnyChanged = true;
+    }
+  }
   if (Ssa.Blocks.size() >= 2) {
     std::vector<llvm::SmallVector<uint32_t, 4>> Preds;
     Ssa.BuildPredecessors(Preds);
-    while (RunIfConvertPass(Ssa, Preds))
+    while (MergeTrivialJumps(Ssa, Preds))
       AnyChanged = true;
+  }
+  if (AnyChanged) {
+    CompactReachableBlocks(Ssa);
+    Ssa.CompactDead();
+  }
+  return AnyChanged;
+}
+
+bool dxcb5::RunOptIfConvert(SsaProgram &Ssa) {
+  llvm::TimeTraceScope Scope("DXCB5 Opt If-Convert", llvm::StringRef());
+  bool AnyChanged = false;
+  if (Ssa.Blocks.size() >= 2) {
+    std::vector<llvm::SmallVector<uint32_t, 4>> Preds;
+    Ssa.BuildPredecessors(Preds);
+    while (RunIfConvertPass(Ssa, Preds)) {
+      AnyChanged = true;
+      MergeTrivialJumps(Ssa, Preds);
+    }
   }
   if (AnyChanged) {
     CompactReachableBlocks(Ssa);

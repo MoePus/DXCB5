@@ -144,7 +144,10 @@ ResolvedLocal ResolveLocalPtr(const Value *Ptr) {
 } // namespace
 
 bool SsaLowerer::InitMutableGlobals() {
-  const Function &Entry = *Module.GetEntryFunction();
+  const Function *EntryPtr = Module.GetEntryFunction();
+  if (!EntryPtr || !Module.GetModule())
+    return Fail("DXIL module has no entry function");
+  const Function &Entry = *EntryPtr;
   for (const GlobalVariable &GV : Module.GetModule()->globals()) {
     if (GV.isConstant() || !GV.hasDefinitiveInitializer() ||
         GV.getType()->getPointerAddressSpace() != 0 ||
@@ -159,6 +162,8 @@ bool SsaLowerer::InitMutableGlobals() {
       continue;
     const uint32_t Count =
         IsScalar ? 1u : static_cast<uint32_t>(Arr->getNumElements());
+    // Total SM5 4096 indexable-element limit is enforced post-optimization in
+    // ValidateMirProgram so IndexablePack/Temps/Ssa can shrink or merge arrays.
     const uint32_t XId = static_cast<uint32_t>(Ssa.Mir.IndexableTemps.size());
     Ssa.Mir.IndexableTemps.push_back({XId, Count, 1u});
     IndexableGlobals[&GV] = XId;
@@ -180,14 +185,15 @@ bool SsaLowerer::LowerAlloca(AllocaInst &Alloca) {
                      Arr->getNumElements() == 0)))
     return Fail("unsupported LLVM alloca: expected static 32-bit scalar or array");
   const uint64_t Count = IsScalar ? 1u : Arr->getNumElements();
-  if (IsScalar ? ValidScalarAllocaUses(Alloca)
-               : (Count <= kLocalArrayMaxElements && ValidLocalArrayUses(Alloca, false))) {
-    LocalArrays[&Alloca] = static_cast<uint32_t>(Ssa.LocalArrayLengths.size());
-    Ssa.LocalArrayLengths.push_back(static_cast<unsigned>(Count));
-    return true;
-  }
-  if (IsScalar || Count > 4096 || !ValidLocalArrayUses(Alloca, true))
+  const bool Valid = IsScalar
+                         ? ValidScalarAllocaUses(Alloca)
+                         : (Count <= 4096 && ValidLocalArrayUses(Alloca, true));
+  if (!Valid)
     return Fail("unsupported SM5 local array access or size exceeds limit");
+  // Route all static scalar and <=4096 local array allocas through the unified
+  // IndexableTemp + IndexablePlan/IndexableSsa promotion engine (Phase B2).
+  // Total SM5 4096 indexable-element limit is enforced post-optimization in
+  // ValidateMirProgram so IndexablePack/Temps/Ssa can shrink or merge arrays.
   const uint32_t XId = static_cast<uint32_t>(Ssa.Mir.IndexableTemps.size());
   Ssa.Mir.IndexableTemps.push_back({XId, static_cast<uint32_t>(Count), 1u});
   IndexableArrays[&Alloca] = XId;
@@ -226,24 +232,7 @@ bool SsaLowerer::LowerLoad(LoadInst &Load) {
   }
   if (!Loc.Alloca)
     return LowerLocalConstant(Load);
-  const uint32_t ArrayId = LocalArrays.lookup(Loc.Alloca);
-  const unsigned Length = Ssa.LocalArrayLengths[ArrayId];
-  SsaInst Read;
-  Read.Opcode = PseudoArrayRead;
-  Read.Dest = Result;
-  Read.ArrayId = ArrayId;
-  if (!Loc.Index) {
-    Read.ArrayLane = 0;
-  } else if (const auto *C = dyn_cast<ConstantInt>(Loc.Index)) {
-    if (C->getZExtValue() >= Length)
-      return Fail("SM5 local array read index is out of bounds");
-    Read.ArrayLane = static_cast<uint8_t>(C->getZExtValue());
-  } else {
-    Read.ArrayLane = 0xffu;
-    Read.Sources.push_back(Source(Loc.Index));
-  }
-  CurrentBlock->Insts.push_back(std::move(Read));
-  return Error.empty();
+  return Fail("unlowered local array load");
 }
 
 bool SsaLowerer::LowerStore(StoreInst &Store) {
@@ -282,17 +271,5 @@ bool SsaLowerer::LowerStore(StoreInst &Store) {
     Emit(D3D10_SB_OPCODE_MOV, Dst, {Val});
     return Error.empty();
   }
-  if (!Loc.Alloca)
-    return Fail("unsupported LLVM store: SM5 requires a private local array");
-  const uint32_t ArrayId = LocalArrays.lookup(Loc.Alloca);
-  const uint64_t Lane = Loc.Index ? cast<ConstantInt>(Loc.Index)->getZExtValue() : 0u;
-  if (Lane >= Ssa.LocalArrayLengths[ArrayId])
-    return Fail("SM5 local array write index is out of bounds");
-  SsaInst Write;
-  Write.Opcode = PseudoArrayWrite;
-  Write.ArrayId = ArrayId;
-  Write.ArrayLane = static_cast<uint8_t>(Lane);
-  Write.Sources.push_back(Source(Store.getValueOperand()));
-  CurrentBlock->Insts.push_back(std::move(Write));
-  return Error.empty();
+  return Fail("unsupported LLVM store: SM5 requires a private local array");
 }

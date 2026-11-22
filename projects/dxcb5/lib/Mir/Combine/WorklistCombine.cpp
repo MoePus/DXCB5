@@ -1,48 +1,57 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 #include "llvm/Support/TimeProfiler.h"
+#include <unordered_map>
 
 using namespace dxcb5;
 using namespace dxcb5::alg;
 
 namespace {
 
-bool IsBoolMaskRec(const SsaProgram &Ssa, const std::vector<SsaDefSite> &Defs,
-                   const Operand &Op, unsigned Depth) {
-  if (Op.Kind == OperandKind::Immediate && !Op.Modifier &&
-      (Op.Index == 0u || Op.Index == 0xffffffffu))
-    return true;
-  if (Depth > 6 || Op.Kind != OperandKind::Temp || Op.Modifier ||
-      Op.RelativeRegister != UINT32_MAX || Op.Index >= Defs.size())
+enum class BinaryImmAction : uint8_t {
+  MovOtherSide,
+  MovConstImm,
+  UnaryOpOtherSide,
+};
+
+struct VerifiedBinaryImmRule {
+  uint32_t Opcode;
+  uint32_t MatchImm;
+  BinaryImmAction Action;
+  uint32_t OutOp;
+  uint32_t OutImm;
+  SemModeReq Req;
+};
+
+constexpr VerifiedBinaryImmRule kVerifiedBinaryImmRules[] = {
+#define DXCB5_BINARY_IMM_RULE(OP, IMM, ACT, OUT_OP, OUT_IMM, REQ)             \
+  {OP, IMM, BinaryImmAction::ACT, OUT_OP, OUT_IMM, SemModeReq::REQ},
+#include "Mir/Combine/GeneratedRules.inc"
+#undef DXCB5_BINARY_IMM_RULE
+};
+
+bool ApplyVerifiedBinaryImmRules(const AlgContext &Ctx, SsaInst &Inst) {
+  if (Inst.Saturate || Inst.Sources.size() != 2)
     return false;
-  const auto &D = Defs[Op.Index];
-  if (!D.Valid() || D.IsAux)
-    return false;
-  if (D.IsPhi) {
-    const auto &Phi = Ssa.Blocks[D.Block].Phis[D.Index];
-    if (Depth > 3 || Phi.Dead || Phi.Inputs.empty() || Phi.Inputs.size() > 4)
-      return false;
-    for (const auto &In : Phi.Inputs)
-      if (!IsBoolMaskRec(Ssa, Defs, In.Value, Depth + 1))
-        return false;
-    return true;
+  for (const auto &R : kVerifiedBinaryImmRules) {
+    if (Inst.Opcode != R.Opcode ||
+        !SatisfiesSemMode(R.Req, Ctx.Ssa.NanSafe, Inst.Precise))
+      continue;
+    for (unsigned Side = 0; Side < 2; ++Side) {
+      if (Inst.Sources[Side].Kind != OperandKind::Immediate ||
+          Inst.Sources[Side].Modifier || Inst.Sources[Side].Index != R.MatchImm)
+        continue;
+      Operand Other = Inst.Sources[1 - Side];
+      if (R.Action == BinaryImmAction::MovOtherSide && Other.Modifier)
+        continue;
+      Inst.Opcode = R.OutOp;
+      if (R.Action == BinaryImmAction::MovConstImm)
+        Inst.Sources.assign({MakeImm(R.OutImm)});
+      else
+        Inst.Sources.assign({Other});
+      return true;
+    }
   }
-  const auto &P = Ssa.Blocks[D.Block].Insts[D.Index];
-  if (P.Dead)
-    return false;
-  if (InstructionIsCompare(P.Opcode))
-    return true;
-  if (P.Opcode == D3D10_SB_OPCODE_NOT)
-    return P.Sources.size() == 1 && IsBoolMaskRec(Ssa, Defs, P.Sources[0], Depth + 1);
-  if (P.Opcode == D3D10_SB_OPCODE_AND || P.Opcode == D3D10_SB_OPCODE_OR ||
-      P.Opcode == D3D10_SB_OPCODE_XOR)
-    return P.Sources.size() == 2 &&
-           IsBoolMaskRec(Ssa, Defs, P.Sources[0], Depth + 1) &&
-           IsBoolMaskRec(Ssa, Defs, P.Sources[1], Depth + 1);
-  if (P.Opcode == D3D10_SB_OPCODE_MOVC)
-    return P.Sources.size() == 3 &&
-           IsBoolMaskRec(Ssa, Defs, P.Sources[1], Depth + 1) &&
-           IsBoolMaskRec(Ssa, Defs, P.Sources[2], Depth + 1);
   return false;
 }
 
@@ -52,6 +61,7 @@ bool SimplifySingleInst(AlgContext &Ctx, uint32_t B, uint32_t &I) {
   Changed |= FoldRelativeIndexOffset(Ctx, Inst);
   Changed |= ForwardSingleUseDynamicCb(Ctx, B, Inst);
   Changed |= TrySimplifyBitfieldAndConstInt(Ctx, Inst);
+  Changed |= ApplyVerifiedBinaryImmRules(Ctx, Inst);
   switch (Inst.Opcode) {
   case D3D10_SB_OPCODE_XOR:
   case D3D10_SB_OPCODE_NOT:
@@ -77,6 +87,14 @@ bool SimplifySingleInst(AlgContext &Ctx, uint32_t B, uint32_t &I) {
   case D3D10_SB_OPCODE_RSQ:
   case D3D10_SB_OPCODE_SQRT:
   case D3D11_SB_OPCODE_RCP:
+  case D3D10_SB_OPCODE_LT:
+  case D3D10_SB_OPCODE_GE:
+  case D3D10_SB_OPCODE_DERIV_RTX:
+  case D3D10_SB_OPCODE_DERIV_RTY:
+  case D3D11_SB_OPCODE_DERIV_RTX_COARSE:
+  case D3D11_SB_OPCODE_DERIV_RTX_FINE:
+  case D3D11_SB_OPCODE_DERIV_RTY_COARSE:
+  case D3D11_SB_OPCODE_DERIV_RTY_FINE:
     Changed |= SimplifyFloatInst(Ctx, B, I);
     break;
   case D3D10_SB_OPCODE_MOVC:
@@ -224,7 +242,7 @@ void dxcb5::alg::CollectUseStats(const SsaProgram &Ssa, UseStats &Stats) {
 bool dxcb5::alg::IsBoolMaskValue(const SsaProgram &Ssa,
                                  const std::vector<SsaDefSite> &Defs,
                                  const Operand &StartOp) {
-  return IsBoolMaskRec(Ssa, Defs, StartOp, 0);
+  return IsKnownBoolMask(Ssa, Defs, StartOp, 0);
 }
 
 bool dxcb5::alg::MatchZextBool(const AlgContext &Ctx, const Operand &Op,
@@ -296,9 +314,7 @@ bool dxcb5::alg::TryResolveLane(const AlgContext &Ctx, const Operand &Op,
 
 bool dxcb5::RunOptAlgebraic(SsaProgram &Ssa) {
   llvm::TimeTraceScope Scope("DXCB5 Opt Algebraic", llvm::StringRef());
-  bool Changed = false;
-  Changed |= SimplifyInstructions(Ssa);
-  Changed |= FoldCopiesAndModifiers(Ssa);
+  const bool Changed = SimplifyInstructions(Ssa);
   if (Changed)
     Ssa.CompactDead();
   return Changed;

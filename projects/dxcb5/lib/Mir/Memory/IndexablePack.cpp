@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptPipeline.h"
+#include "Mir/Memory/MemoryOpt.h"
 #include "dxcb5/InstructionInfo.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
@@ -224,7 +224,7 @@ void RewritePackedInst(SsaProgram &Ssa, SsaInst &Inst,
     const PackTarget &T = Plan[Src.Index];
     Src.Index = T.NewX;
     if (T.Packed)
-      Src.Swizzle = static_cast<uint8_t>(T.Lane * 0x55u);
+      Src.Swizzle = BroadcastLaneSwizzle(T.Lane);
   }
   if (Inst.Dest.Kind != OperandKind::IndexableTemp || Inst.Dest.Index >= NumX)
     return;
@@ -237,11 +237,12 @@ void RewritePackedInst(SsaProgram &Ssa, SsaInst &Inst,
     return;
   Operand &Src = Inst.Sources[0];
   if (Src.Kind == OperandKind::ImmediateVector) {
+    const uint8_t L0 = GetSwizzleLane(Src.Swizzle, 0);
     Src = Operand{OperandKind::Immediate,
-                  Ssa.Mir.LiteralVectors[Src.Index][0]};
+                  Ssa.Mir.LiteralVectors[Src.Index][L0]};
   } else if (Src.Kind != OperandKind::Immediate) {
     const uint8_t L0 = GetSwizzleLane(Src.Swizzle, 0);
-    Src.Swizzle = static_cast<uint8_t>(L0 * 0x55u);
+    Src.Swizzle = BroadcastLaneSwizzle(L0);
   }
 }
 
@@ -282,8 +283,8 @@ void FlushLoadGroup(SsaProgram &Ssa, SsaBlock &Block,
   for (uint8_t M = 1; M < G.Count; ++M)
     Block.Insts[G.InstIdx[M]].Dead = true;
   for (uint8_t M = 0; M < G.Count; ++M)
-    Repl[G.DstSsa[M]] = Operand{OperandKind::Temp, VecId, 0, 1,
-                                static_cast<uint8_t>(M * 0x55u)};
+    Repl[G.DstSsa[M]] =
+        Operand{OperandKind::Temp, VecId, 0, 1, BroadcastLaneSwizzle(M)};
 }
 
 void ApplyScalarLoadRepls(SsaProgram &Ssa,
@@ -430,8 +431,9 @@ void FlushStoreGroup(SsaProgram &Ssa, SsaBlock &Block,
   Operand VecSrc = G.BaseSrc;
   VecSrc.Swizzle = 0;
   for (uint8_t M = 0; M < G.Count; ++M)
-    VecSrc.Swizzle = SetSwizzleLane(VecSrc.Swizzle, G.DstLane[M],
-                                    GetSwizzleLane(G.Srcs[M].Swizzle, 0));
+    VecSrc.Swizzle = SetSwizzleLane(
+        VecSrc.Swizzle, G.DstLane[M],
+        GetSwizzleLane(G.Srcs[M].Swizzle, G.DstLane[M]));
   Block.Insts[Target].Sources[0] = VecSrc;
 }
 
@@ -476,12 +478,10 @@ void NoteArrayRead(llvm::SmallVectorImpl<PendingStoreGroup> &Active,
   for (auto &G : Active) {
     if (G.NewX != Src.Index)
       continue;
-    if (G.EmitAtAnchor) {
-      G.BlockedLanes |= RL;
-    } else if ((G.LaneMask & RL) != 0) {
+    G.BlockedLanes |= RL;
+    if (!G.EmitAtAnchor && (G.LaneMask & RL) != 0) {
       G.EmitAtAnchor = true;
       G.AnchorIdx = G.InstIdx[G.Count - 1];
-      G.BlockedLanes = RL;
     }
   }
 }

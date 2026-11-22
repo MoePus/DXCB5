@@ -13,7 +13,7 @@ namespace dxcb5 {
 enum class Stage { Vertex, Pixel };
 enum class OperandKind {
   Temp, Input, Output, Immediate, ConstantBuffer, Resource, Sampler, Null,
-  FrontFace, ImmediateConstantBuffer, ImmediateVector, IndexableTemp,
+  ImmediateConstantBuffer, ImmediateVector, IndexableTemp,
   OutputDepth, Uav, InputCoverage, OutputMask
 };
 

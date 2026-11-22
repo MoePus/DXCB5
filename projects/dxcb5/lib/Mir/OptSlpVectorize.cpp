@@ -176,17 +176,21 @@ struct BlockPackIndex {
   llvm::DenseMap<uint64_t, llvm::SmallVector<uint32_t, 8>> Buckets;
   std::vector<uint32_t> PosInBucket;
 
-  void Build(const SsaBlock &Block) {
+  void Build(const SsaBlock &Block, uint32_t BlockId,
+             const std::vector<SsaDefSite> &Defs,
+             const std::vector<uint8_t> &Escapes) {
     const size_t N = Block.Insts.size();
     SlpBarPref.assign(N + 1, 0);
     BarPref.assign(N + 1, 0);
     Buckets.clear();
     PosInBucket.assign(N, UINT32_MAX);
+    std::vector<uint8_t> DotRedexMul;
+    FindDotRedexMuls(Block, Defs, BlockId, Escapes, DotRedexMul);
     for (uint32_t I = 0; I < N; ++I) {
       const auto &Inst = Block.Insts[I];
       SlpBarPref[I + 1] = SlpBarPref[I] + (!Inst.Dead && IsSlpBarrier(Inst));
       BarPref[I + 1] = BarPref[I] + (!Inst.Dead && Inst.IsBarrier());
-      if (Inst.Dead || !IsVectorizableInst(Inst) ||
+      if (Inst.Dead || DotRedexMul[I] || !IsVectorizableInst(Inst) ||
           PackDest(Inst).Kind != OperandKind::Temp)
         continue;
       auto &B = Buckets[ComputeShapeKey(Inst)];
@@ -349,13 +353,14 @@ struct PackInsertion {
 
 bool RunSameFamilyPackBlock(SsaProgram &Ssa, uint32_t BlockId,
                             const std::vector<SsaDefSite> &Defs,
+                            const std::vector<uint8_t> &Escapes,
                             FirstLocalUseCache &UseCache,
                             BlockPackIndex &PackIdx,
                             llvm::DenseMap<uint32_t, LaneRemap> &AllRemaps) {
   auto &Block = Ssa.Blocks[BlockId];
   if (Block.Insts.size() < 2)
     return false;
-  PackIdx.Build(Block);
+  PackIdx.Build(Block, BlockId, Defs, Escapes);
   if (PackIdx.Buckets.empty())
     return false;
   UseCache.Reset(Block, Ssa.NextValueId);
@@ -464,7 +469,8 @@ bool RunSameFamilyPack(SsaProgram &Ssa, FirstLocalUseCache &UseCache,
     for (uint32_t B = 0; B < Ssa.Blocks.size(); ++B) {
       if (!Dirty[B])
         continue;
-      if (RunSameFamilyPackBlock(Ssa, B, Defs, UseCache, PackIdx, AllRemaps)) {
+      if (RunSameFamilyPackBlock(Ssa, B, Defs, Escapes, UseCache, PackIdx,
+                                 AllRemaps)) {
         ModifiedBlocks.push_back(B);
         NextDirty[B] = 1;
       }

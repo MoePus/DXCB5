@@ -11,6 +11,9 @@ using namespace dxcb5;
 namespace dxcb5 {
 bool MatchHorizontalDots(SsaProgram &Ssa, const std::vector<SsaDefSite> &Defs,
                          const std::vector<uint32_t> &UseCount);
+bool MatchTransposedGatherDots(SsaProgram &Ssa,
+                               const std::vector<SsaDefSite> &Defs,
+                               const std::vector<uint32_t> &UseCount);
 } // namespace dxcb5
 
 namespace {
@@ -417,25 +420,30 @@ bool MaterializeSharedDp3Group(SsaProgram &Ssa, SsaBlock &Block,
   return true;
 }
 
-bool SelectBlockDots(SsaProgram &Ssa, uint32_t B,
-                     const std::vector<SsaDefSite> &Defs,
-                     const std::vector<uint32_t> &UseCount) {
+bool SelectDirectBlockDots(SsaProgram &Ssa, uint32_t B,
+                           const std::vector<SsaDefSite> &Defs,
+                           const std::vector<uint32_t> &UseCount,
+                           llvm::ArrayRef<unsigned> Widths,
+                           bool RequireConsumed) {
   auto &Block = Ssa.Blocks[B];
   bool Changed = false;
   for (size_t Rev = Block.Insts.size(); Rev > 0; --Rev) {
     const uint32_t I = static_cast<uint32_t>(Rev - 1);
     if (Block.Insts[I].Dead)
       continue;
-    for (unsigned W : {4u, 3u}) {
+    for (unsigned W : Widths) {
       ChainInfo Chain;
       if (!MatchDotChain(Ssa, Defs, UseCount, B, I, W, Chain))
+        continue;
+      if (RequireConsumed && Chain.ConsumedInsts.empty())
         continue;
       Operand A, C;
       if (!MatchDirectDotSides(
               Ssa, llvm::makeArrayRef(Chain.Terms.data(), W), A, C))
         continue;
       auto &Root = Block.Insts[I];
-      Root.Opcode = W == 4 ? D3D10_SB_OPCODE_DP4 : D3D10_SB_OPCODE_DP3;
+      Root.Opcode = W == 4 ? D3D10_SB_OPCODE_DP4
+                           : (W == 3 ? D3D10_SB_OPCODE_DP3 : D3D10_SB_OPCODE_DP2);
       Root.Sources.assign({A, C});
       for (uint32_t DeadIdx : Chain.ConsumedInsts)
         Block.Insts[DeadIdx].Dead = true;
@@ -443,6 +451,16 @@ bool SelectBlockDots(SsaProgram &Ssa, uint32_t B,
       break;
     }
   }
+  return Changed;
+}
+
+bool SelectBlockDots(SsaProgram &Ssa, uint32_t B,
+                     const std::vector<SsaDefSite> &Defs,
+                     const std::vector<uint32_t> &UseCount) {
+  auto &Block = Ssa.Blocks[B];
+  static constexpr unsigned kDp43[] = {4u, 3u};
+  bool Changed =
+      SelectDirectBlockDots(Ssa, B, Defs, UseCount, kDp43, false);
   llvm::SmallVector<SharedGroup, 8> Groups;
   for (uint32_t I = 0; I < Block.Insts.size(); ++I) {
     if (Block.Insts[I].Dead)
@@ -471,6 +489,10 @@ bool dxcb5::RunOptSelectDots(SsaProgram &Ssa) {
 
   bool Changed = ForwardDynamicCbIntoDots(Ssa, Defs, UseCount);
   Changed |= MatchHorizontalDots(Ssa, Defs, UseCount);
+  if (MatchTransposedGatherDots(Ssa, Defs, UseCount)) {
+    Ssa.CompactDead();
+    return true;
+  }
   for (uint32_t B = 0; B < Ssa.Blocks.size(); ++B)
     Changed |= SelectBlockDots(Ssa, B, Defs, UseCount);
   if (Changed)
@@ -485,29 +507,10 @@ bool dxcb5::RunOptSelectDp2(SsaProgram &Ssa) {
   std::vector<uint32_t> UseCount;
   CountValueUses(Ssa, UseCount);
 
+  static constexpr unsigned kDp2[] = {2u};
   bool Changed = false;
-  for (uint32_t B = 0; B < Ssa.Blocks.size(); ++B) {
-    auto &Block = Ssa.Blocks[B];
-    for (size_t Rev = Block.Insts.size(); Rev > 0; --Rev) {
-      const uint32_t I = static_cast<uint32_t>(Rev - 1);
-      if (Block.Insts[I].Dead)
-        continue;
-      ChainInfo Chain;
-      if (!MatchDotChain(Ssa, Defs, UseCount, B, I, 2u, Chain) ||
-          Chain.ConsumedInsts.empty())
-        continue;
-      Operand A, C;
-      if (!MatchDirectDotSides(
-              Ssa, llvm::makeArrayRef(Chain.Terms.data(), 2u), A, C))
-        continue;
-      auto &Root = Block.Insts[I];
-      Root.Opcode = D3D10_SB_OPCODE_DP2;
-      Root.Sources.assign({A, C});
-      for (uint32_t DeadIdx : Chain.ConsumedInsts)
-        Block.Insts[DeadIdx].Dead = true;
-      Changed = true;
-    }
-  }
+  for (uint32_t B = 0; B < Ssa.Blocks.size(); ++B)
+    Changed |= SelectDirectBlockDots(Ssa, B, Defs, UseCount, kDp2, true);
   if (Changed)
     Ssa.CompactDead();
   return Changed;

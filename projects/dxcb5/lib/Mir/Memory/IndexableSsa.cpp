@@ -1,6 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptIndexableSsa.h"
-#include "Mir/OptPipeline.h"
+#include "Mir/Memory/IndexableSsa.h"
+#include "Mir/Memory/MemoryOpt.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <algorithm>
 #include <vector>

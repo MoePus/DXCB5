@@ -1,8 +1,9 @@
 // Distributed under the University of Illinois Open Source License.
-#ifndef DXCB5_MIR_OPT_ALGEBRAIC_COMMON_H
-#define DXCB5_MIR_OPT_ALGEBRAIC_COMMON_H
+#ifndef DXCB5_MIR_COMBINE_COMBINE_COMMON_H
+#define DXCB5_MIR_COMBINE_COMBINE_COMMON_H
 
 #include "Mir/OptPipeline.h"
+#include "Mir/Analysis/LaneAnalysis.h"
 #include "dxcb5/InstructionInfo.h"
 #include "llvm/Support/MathExtras.h"
 #include <cmath>
@@ -11,6 +12,26 @@
 
 namespace dxcb5 {
 namespace alg {
+
+// Mirrors DXCB5.RewriteRules.ModeReq from lean/RewriteRules.lean.
+enum class SemModeReq : uint8_t {
+  Always,
+  NotPrecise,
+  NotPreciseNotNanSafe,
+  NotPreciseAndNonNaNF,
+};
+
+inline bool SatisfiesSemMode(SemModeReq Req, bool NanSafe, bool Precise,
+                             bool NonNaNF = false) {
+  switch (Req) {
+  case SemModeReq::Always: return true;
+  case SemModeReq::NotPrecise: return !Precise;
+  case SemModeReq::NotPreciseNotNanSafe: return !Precise && !NanSafe;
+  case SemModeReq::NotPreciseAndNonNaNF:
+    return !Precise && (!NanSafe || NonNaNF);
+  }
+  return false;
+}
 
 constexpr uint32_t kPosZeroBits = kFloatPosZeroBits;
 constexpr uint32_t kNegZeroBits = kFloatNegZeroBits;
@@ -207,9 +228,15 @@ bool TryReassociateConstFloat(AlgContext &Ctx, SsaInst &Inst);
 bool SimplifyAddInst(AlgContext &Ctx, uint32_t B, SsaInst &Inst);
 bool SimplifyMadInst(AlgContext &Ctx, SsaInst &Inst);
 bool SimplifyMinMaxInst(AlgContext &Ctx, SsaInst &Inst);
-bool SimplifyExpInst(AlgContext &Ctx, SsaInst &Inst);
+bool SimplifyExpInst(AlgContext &Ctx, uint32_t B, uint32_t &I);
 bool SimplifyDivInst(AlgContext &Ctx, uint32_t B, SsaInst &Inst);
 bool CanonicalizeMulMadNegImm(SsaProgram &Ssa, SsaInst &Inst);
+inline bool IsKnownNonNegativeFloat(const AlgContext &Ctx, const Operand &Op,
+                                    uint8_t Mask, bool AllowNegZero,
+                                    unsigned Depth = 0) {
+  return dxcb5::IsKnownNonNegativeFloat(Ctx.Ssa, Ctx.Defs, Op, Mask,
+                                        AllowNegZero, Depth);
+}
 bool SimplifySelectAndDotInst(AlgContext &Ctx, uint32_t B, uint32_t &I);
 bool RunGlobalAlgebraicFolds(AlgContext &Ctx);
 

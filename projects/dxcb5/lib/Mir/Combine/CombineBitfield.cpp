@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 
 using namespace dxcb5;
 using namespace dxcb5::alg;
@@ -390,9 +390,72 @@ uint32_t dxcb5::alg::KnownPossibleOnes(const AlgContext &Ctx, const Operand &Op,
   return 0xffffffffu;
 }
 
+bool TrySimplifyUdivPow2(AlgContext &Ctx, SsaInst &Inst) {
+  if (Inst.Saturate || Inst.Sources.size() != 2 ||
+      Inst.Sources[1].Modifier || Inst.Sources[1].RelativeRegister != UINT32_MAX)
+    return false;
+  const bool RemOnly = Inst.Dest.Kind == OperandKind::Null &&
+                       Inst.AuxDest.Kind == OperandKind::Temp;
+  const bool QuotOnly = Inst.Dest.Kind == OperandKind::Temp &&
+                        Inst.AuxDest.Kind == OperandKind::Null;
+  if (!RemOnly && !QuotOnly)
+    return false;
+  const Operand &OutDst = RemOnly ? Inst.AuxDest : Inst.Dest;
+  const uint8_t Mask = OutDst.Mask;
+  if (Mask == 0)
+    return false;
+  std::array<uint32_t, 4> ValBits{};
+  bool AllSame = true, AllOne = true;
+  uint32_t FirstVal = 0;
+  bool HaveFirst = false;
+  for (unsigned L = 0; L < kRegisterLanes; ++L) {
+    if (!(Mask & (1u << L)))
+      continue;
+    uint32_t D = 0;
+    if (!ExtractLaneImm(Ctx.Ssa, Inst.Sources[1], L, D) || D == 0u ||
+        (D & (D - 1u)) != 0u)
+      return false;
+    const uint32_t V =
+        RemOnly ? (D - 1u) : static_cast<uint32_t>(llvm::countTrailingZeros(D));
+    ValBits[L] = V;
+    AllOne &= (D == 1u);
+    if (!HaveFirst) {
+      FirstVal = V;
+      HaveFirst = true;
+    } else if (V != FirstVal) {
+      AllSame = false;
+    }
+  }
+  if (!HaveFirst)
+    return false;
+  if (RemOnly) {
+    Inst.Dest = Inst.AuxDest;
+    Inst.AuxDest = Operand();
+  }
+  if (AllOne) {
+    Inst.Opcode = D3D10_SB_OPCODE_MOV;
+    if (RemOnly)
+      Inst.Sources.assign({MakeImm(0u)});
+    else
+      Inst.Sources.resize(1);
+    return true;
+  }
+  Inst.Opcode = RemOnly ? D3D10_SB_OPCODE_AND : D3D10_SB_OPCODE_USHR;
+  if (AllSame) {
+    Inst.Sources[1] = MakeImm(FirstVal);
+  } else {
+    Inst.Sources[1] = {OperandKind::ImmediateVector,
+                       Ctx.Ssa.InternLiteralVector(ValBits), 0, Mask,
+                       kIdentitySwizzle};
+  }
+  return true;
+}
+
 bool dxcb5::alg::TrySimplifyBitfieldAndConstInt(AlgContext &Ctx, SsaInst &Inst) {
   if (TryFoldConstInt(Inst))
     return true;
+  if (Inst.Opcode == D3D10_SB_OPCODE_UDIV)
+    return TrySimplifyUdivPow2(Ctx, Inst);
   if (Inst.Opcode == D3D10_SB_OPCODE_AND)
     return TrySelectFromAnd(Ctx, Inst);
   if (Inst.Opcode == D3D10_SB_OPCODE_USHR || Inst.Opcode == D3D10_SB_OPCODE_ISHL)

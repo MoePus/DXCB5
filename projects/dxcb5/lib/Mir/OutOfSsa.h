@@ -9,7 +9,7 @@
 namespace dxcb5 {
 
 // Destroys SSA form into FlowBlocks with explicit edge ParallelCopies,
-// lowering PseudoCombineVec / PseudoArray ops and compacting virtual temp IDs.
+// lowering PseudoCombineVec ops and compacting virtual temp IDs.
 void LowerOutOfSsa(SsaProgram &Ssa, std::vector<FlowBlock> &Blocks);
 
 } // namespace dxcb5

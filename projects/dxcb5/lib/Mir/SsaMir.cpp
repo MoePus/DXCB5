@@ -8,21 +8,17 @@ namespace dxcb5 {
 
 uint8_t InstructionSourceSlotMask(uint32_t Opcode, uint8_t DestMask,
                                   size_t SrcIndex) {
-  if (Opcode == PseudoCombineVec || Opcode == PseudoArrayRead ||
-      Opcode == PseudoArrayWrite)
-    return 0x1u;
   return InstructionSourceSlotMaskSm5(Opcode, DestMask, SrcIndex);
 }
 
 bool SsaInst::IsPure() const {
-  if (Opcode == PseudoCombineVec)
-    return true;
   return !IsBarrier();
 }
 
 bool SsaInst::IsBarrier() const {
-  if (Opcode == PseudoArrayRead || Opcode == PseudoArrayWrite ||
-      Opcode == D3D10_SB_OPCODE_DISCARD || InstructionRequiresQuad(Opcode))
+  const bool SrvOrUavBufLoad = Opcode == D3D11_SB_OPCODE_LD_RAW ||
+                               Opcode == D3D11_SB_OPCODE_LD_STRUCTURED;
+  if (!SrvOrUavBufLoad && !InstructionCanMoveAcrossDivergentBranch(Opcode))
     return true;
   if (Dest.Kind == OperandKind::Output ||
       Dest.Kind == OperandKind::OutputDepth ||
@@ -206,7 +202,7 @@ void SsaProgram::CompactDead() {
   }
 }
 
-bool SsaProgram::Verify(std::string &Error) const {
+bool SsaProgram::Verify(std::string &Error, bool RequireNormalizedCfg) const {
   std::vector<SsaDefSite> Defs(NextValueId);
   std::vector<uint8_t> DefMasks(NextValueId, 0);
 
@@ -253,8 +249,21 @@ bool SsaProgram::Verify(std::string &Error) const {
   SsaDomTree Dom;
   ComputeDominators(Dom);
 
+  auto CheckIndexable = [&](const Operand &Op) -> bool {
+    if (Op.Kind != OperandKind::IndexableTemp)
+      return true;
+    if (Op.Index >= Mir.IndexableTemps.size())
+      return (Error = "indexable temp index out of range"), false;
+    if (Op.RelativeRegister == UINT32_MAX &&
+        Op.Element >= Mir.IndexableTemps[Op.Index].Elements)
+      return (Error = "indexable temp element out of range"), false;
+    return true;
+  };
+
   auto CheckUse = [&](const Operand &Op, uint8_t SlotMask, uint32_t UseBlock,
                       uint32_t UseInstIndex, bool IsPhiEdge) -> bool {
+    if (!CheckIndexable(Op))
+      return false;
     if (Op.RelativeRegister != UINT32_MAX) {
       if (Op.RelativeRegister == 0 || Op.RelativeRegister >= NextValueId ||
           !Defs[Op.RelativeRegister].Valid()) {
@@ -316,6 +325,8 @@ bool SsaProgram::Verify(std::string &Error) const {
       const uint8_t DMask = Inst.Dest.Kind == OperandKind::Null
                                 ? Inst.AuxDest.Mask
                                 : Inst.Dest.Mask;
+      if (!CheckIndexable(Inst.Dest) || !CheckIndexable(Inst.AuxDest))
+        return false;
       if (Inst.Dest.RelativeRegister != UINT32_MAX &&
           !CheckUse(Inst.Dest, 0x1u, B, I, false))
         return false;
@@ -328,6 +339,34 @@ bool SsaProgram::Verify(std::string &Error) const {
     if ((Block.Kind == FlowKind::Branch || Block.Kind == FlowKind::Switch) &&
         !CheckUse(Block.Condition, 0x1u, B, UINT32_MAX, false))
       return false;
+  }
+  if (RequireNormalizedCfg) {
+    std::vector<llvm::SmallVector<uint32_t, 4>> Preds;
+    BuildPredecessors(Preds);
+    for (uint32_t B = 0; B < Blocks.size(); ++B) {
+      if (!Dom.Reachable(B))
+        return (Error = "unreachable block in normalized SSA CFG"), false;
+      const auto &Block = Blocks[B];
+      if ((Block.Kind == FlowKind::Branch || Block.Kind == FlowKind::Switch) &&
+          Block.Condition.Kind == OperandKind::Immediate &&
+          Block.Condition.Modifier == 0 &&
+          Block.Condition.RelativeRegister == UINT32_MAX)
+        return (Error = "unfolded constant branch/switch in normalized SSA CFG"),
+               false;
+      if (Block.Kind == FlowKind::Jump && Block.Successors.size() == 1) {
+        const uint32_t Succ = Block.Successors[0];
+        if (Succ != 0 && Succ != B && Succ < Blocks.size() &&
+            Preds[Succ].size() == 1 && Preds[Succ][0] == B) {
+          bool HasLivePhi = false;
+          for (const auto &Phi : Blocks[Succ].Phis)
+            if (!Phi.Dead)
+              HasLivePhi = true;
+          if (!HasLivePhi)
+            return (Error = "unmerged trivial jump in normalized SSA CFG"),
+                   false;
+        }
+      }
+    }
   }
   return true;
 }

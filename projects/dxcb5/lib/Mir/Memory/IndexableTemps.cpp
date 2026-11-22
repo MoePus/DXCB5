@@ -1,6 +1,7 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptIndexableSsa.h"
-#include "Mir/OptPipeline.h"
+#include "Mir/Memory/IndexableSsa.h"
+#include "Mir/Memory/MemoryOpt.h"
+#include "Mir/Analysis/LaneAnalysis.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include <algorithm>
@@ -497,7 +498,64 @@ bool PruneAndCompactArrays(SsaProgram &Ssa) {
     }
   }
   Ssa.Mir.IndexableTemps = std::move(Kept);
+#ifndef NDEBUG
+  for (const auto &Block : Ssa.Blocks) {
+    for (const auto &Inst : Block.Insts) {
+      if (Inst.Dead)
+        continue;
+      if (Inst.Dest.Kind == OperandKind::IndexableTemp) {
+        assert(Inst.Dest.Index < Ssa.Mir.IndexableTemps.size());
+        assert(Inst.Dest.RelativeRegister != UINT32_MAX ||
+               Inst.Dest.Element < Ssa.Mir.IndexableTemps[Inst.Dest.Index].Elements);
+      }
+      for (const auto &Src : Inst.Sources) {
+        if (Src.Kind == OperandKind::IndexableTemp) {
+          assert(Src.Index < Ssa.Mir.IndexableTemps.size());
+          assert(Src.RelativeRegister != UINT32_MAX ||
+                 Src.Element < Ssa.Mir.IndexableTemps[Src.Index].Elements);
+        }
+      }
+    }
+  }
+#endif
   return true;
+}
+
+bool ShrinkArraysByReadBounds(SsaProgram &Ssa, const SsaDomTree &Dom) {
+  const size_t NumX = Ssa.Mir.IndexableTemps.size();
+  std::vector<uint32_t> MaxElem;
+  ComputeIndexableMaxReadElements(Ssa, Dom, MaxElem);
+  std::vector<uint8_t> AnyDynWrite(NumX, 0);
+  for (const auto &Blk : Ssa.Blocks) {
+    for (const auto &Inst : Blk.Insts) {
+      if (!Inst.Dead && Inst.Dest.Kind == OperandKind::IndexableTemp &&
+          Inst.Dest.Index < NumX && Inst.Dest.RelativeRegister != UINT32_MAX)
+        AnyDynWrite[Inst.Dest.Index] = 1;
+    }
+  }
+  bool Changed = false;
+  for (auto &Blk : Ssa.Blocks) {
+    for (auto &Inst : Blk.Insts) {
+      if (Inst.Dead || Inst.Dest.Kind != OperandKind::IndexableTemp ||
+          Inst.Dest.Index >= NumX || Inst.Dest.RelativeRegister != UINT32_MAX)
+        continue;
+      const uint32_t MaxR = MaxElem[Inst.Dest.Index];
+      if (MaxR == UINT32_MAX || Inst.Dest.Element > MaxR) {
+        Inst.Dead = true;
+        Changed = true;
+      }
+    }
+  }
+  for (size_t X = 0; X < NumX; ++X) {
+    if (AnyDynWrite[X] || MaxElem[X] == UINT32_MAX)
+      continue;
+    const uint32_t NewElems = MaxElem[X] + 1u;
+    if (NewElems < Ssa.Mir.IndexableTemps[X].Elements) {
+      Ssa.Mir.IndexableTemps[X].Elements = NewElems;
+      Changed = true;
+    }
+  }
+  return Changed;
 }
 
 } // namespace
@@ -521,11 +579,14 @@ bool dxcb5::RunOptIndexableTemps(SsaProgram &Ssa) {
     TotalSlots += N;
   }
 
-  if (TotalSlots > 0 && !Ssa.Blocks.empty()) {
+  if (!Ssa.Blocks.empty()) {
     SsaDomTree Dom;
     Ssa.ComputeDominators(Dom);
-    Changed |= RunGlobalForwardPass(Ssa, Dom, SlotBase, TotalSlots);
-    Changed |= RunGlobalDeadStorePass(Ssa, Dom, SlotBase, TotalSlots);
+    if (TotalSlots > 0) {
+      Changed |= RunGlobalForwardPass(Ssa, Dom, SlotBase, TotalSlots);
+      Changed |= RunGlobalDeadStorePass(Ssa, Dom, SlotBase, TotalSlots);
+    }
+    Changed |= ShrinkArraysByReadBounds(Ssa, Dom);
   }
   if (Changed)
     Ssa.CompactDead();

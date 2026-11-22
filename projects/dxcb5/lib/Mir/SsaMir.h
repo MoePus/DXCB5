@@ -28,20 +28,6 @@ constexpr uint32_t kFloatNegZeroBits = kFloatSignBit;
 constexpr uint32_t kFloatPosOneBits = 0x3f800000u;
 constexpr uint32_t kFloatNegOneBits = 0xbf800000u;
 
-// Pseudo-opcodes living only inside SSA MIR (eliminated before or during OutOfSsa).
-enum SsaPseudoOpcode : uint32_t {
-  // Assembles 2..4 scalar/sub-vector sources into one SSA vector value.
-  // Sources[i] supplies lane i (only lanes present in Dest.Mask are populated).
-  PseudoCombineVec = 0x10000u,
-  // Private local array (1..4 elements) read/write for SM5 alloca lowering.
-  PseudoArrayRead = 0x10001u,
-  PseudoArrayWrite = 0x10002u,
-};
-
-inline bool IsPseudoOpcode(uint32_t Opcode) {
-  return Opcode >= PseudoCombineVec;
-}
-
 inline unsigned GetSwizzleLane(uint8_t Swizzle, unsigned Slot) {
   return (Swizzle >> (kLaneBits * Slot)) & kLaneIndexMask;
 }
@@ -114,12 +100,7 @@ inline uint8_t MaskForWidth(unsigned Width) {
 }
 
 inline uint8_t ReadLanesForMask(uint8_t Swizzle, uint8_t ActiveSlots) {
-  uint8_t Lanes = 0;
-  for (unsigned Slot = 0; Slot < kRegisterLanes; ++Slot) {
-    if (ActiveSlots & (1u << Slot))
-      Lanes |= static_cast<uint8_t>(1u << GetSwizzleLane(Swizzle, Slot));
-  }
-  return Lanes;
+  return SwizzledReadLanes(Swizzle, ActiveSlots);
 }
 
 inline uint8_t DotSourceSlotMask(uint32_t Opcode) {
@@ -170,18 +151,15 @@ struct SsaInst {
   bool TestNonZero = true;
   bool Saturate = false;
   bool Precise = false;
+  bool FastMath = false;
   bool Dead = false;
   int8_t TexelOffset[3] = {};
-  uint32_t ArrayId = UINT32_MAX; // For PseudoArrayRead / PseudoArrayWrite
-  uint8_t ArrayLane = 0;         // Constant lane for PseudoArrayWrite/Read (0xff = dynamic)
 
   bool HasAuxDest() const {
-    return !IsPseudoOpcode(Opcode) && InstructionDestinationCount(Opcode) == 2;
+    return InstructionDestinationCount(Opcode) == 2;
   }
   bool HasPrimaryDest() const {
-    return IsPseudoOpcode(Opcode)
-               ? Opcode != PseudoArrayWrite
-               : InstructionDestinationCount(Opcode) >= 1;
+    return InstructionDestinationCount(Opcode) >= 1;
   }
   bool IsPure() const;
   bool IsBarrier() const;
@@ -195,6 +173,8 @@ struct SsaBlock {
   // Branch: [true, false]. Switch: [default, case0, ...]. Jump: [target].
   llvm::SmallVector<uint32_t, 4> Successors;
   llvm::SmallVector<uint32_t, 4> CaseValues;
+  bool StrictBranch = false;
+  bool UniformBranch = false;
 };
 
 struct SsaDefSite {
@@ -225,7 +205,6 @@ public:
   MirProgram &Mir;
   std::vector<SsaBlock> Blocks;
   uint32_t NextValueId = 1; // 1-based SSA value IDs
-  std::vector<unsigned> LocalArrayLengths;
   bool NanSafe = false;
 
   uint32_t AllocValue() { return NextValueId++; }
@@ -239,8 +218,8 @@ public:
   // Removes Dead phis and Dead instructions from every block.
   void CompactDead();
 
-  // Debug-mode structural & SSA invariant checker.
-  bool Verify(std::string &Error) const;
+  // Structural, SSA, and optional N-grade CFG normal-form checker.
+  bool Verify(std::string &Error, bool RequireNormalizedCfg = false) const;
 
 private:
   llvm::DenseMap<uint64_t, llvm::SmallVector<uint32_t, 2>> LiteralBuckets;

@@ -522,6 +522,138 @@ bool dxcb5::slp::FindPackAnchor(const SsaBlock &Block,
   return true;
 }
 
+void dxcb5::slp::FindDotRedexMuls(const SsaBlock &Block,
+                                  const std::vector<SsaDefSite> &Defs,
+                                  uint32_t BlockId,
+                                  const std::vector<uint8_t> &Escapes,
+                                  std::vector<uint8_t> &OutDotMul) {
+  const size_t N = Block.Insts.size();
+  OutDotMul.assign(N, 0);
+  if (N < 3)
+    return;
+
+  llvm::DenseMap<uint32_t, uint32_t> LocalUses;
+  auto IsScalarAddOrMul = [&](const SsaInst &I) {
+    return !I.Dead && !I.Precise && !I.Saturate &&
+           I.Dest.Kind == OperandKind::Temp && I.Dest.Mask == 1u &&
+           !I.HasAuxDest() && I.Sources.size() == 2 &&
+           (I.Opcode == D3D10_SB_OPCODE_MUL ||
+            I.Opcode == D3D10_SB_OPCODE_ADD);
+  };
+  bool HasScalarAdd = false;
+  for (const auto &I : Block.Insts) {
+    if (!IsScalarAddOrMul(I))
+      continue;
+    LocalUses[I.Dest.Index] = 0;
+    if (I.Opcode == D3D10_SB_OPCODE_ADD)
+      HasScalarAdd = true;
+  }
+  if (!HasScalarAdd)
+    return;
+
+  auto CountOp = [&](const Operand &Op) {
+    if (Op.Kind == OperandKind::Temp) {
+      auto It = LocalUses.find(Op.Index);
+      if (It != LocalUses.end())
+        ++It->second;
+    }
+    if (Op.RelativeRegister != UINT32_MAX) {
+      auto It = LocalUses.find(Op.RelativeRegister);
+      if (It != LocalUses.end())
+        ++It->second;
+    }
+  };
+  for (const auto &I : Block.Insts) {
+    if (I.Dead)
+      continue;
+    if (I.Dest.RelativeRegister != UINT32_MAX) {
+      auto It = LocalUses.find(I.Dest.RelativeRegister);
+      if (It != LocalUses.end())
+        ++It->second;
+    }
+    for (const auto &Src : I.Sources)
+      CountOp(Src);
+  }
+  if (Block.Kind == FlowKind::Branch || Block.Kind == FlowKind::Switch)
+    CountOp(Block.Condition);
+
+  auto IsDotSourceCompat = [](const Operand &A, const Operand &B) {
+    const bool ImmA = A.Kind == OperandKind::Immediate && !A.Modifier;
+    const bool ImmB = B.Kind == OperandKind::Immediate && !B.Modifier;
+    if (ImmA && ImmB)
+      return true;
+    return (A.Kind == OperandKind::Temp || A.Kind == OperandKind::Input ||
+            A.Kind == OperandKind::ConstantBuffer) &&
+           SameOperandBase(A, B);
+  };
+  auto MulPairCompat = [&](const SsaInst &M0, const SsaInst &M1) {
+    return (IsDotSourceCompat(M0.Sources[0], M1.Sources[0]) &&
+            IsDotSourceCompat(M0.Sources[1], M1.Sources[1])) ||
+           (IsDotSourceCompat(M0.Sources[0], M1.Sources[1]) &&
+            IsDotSourceCompat(M0.Sources[1], M1.Sources[0]));
+  };
+
+  auto IsSingleUseLocal = [&](uint32_t ValId) {
+    if (ValId < Escapes.size() && Escapes[ValId])
+      return false;
+    auto It = LocalUses.find(ValId);
+    return It != LocalUses.end() && It->second == 1;
+  };
+
+  for (uint32_t I = 0; I < N; ++I) {
+    const auto &Root = Block.Insts[I];
+    if (Root.Dead || Root.Precise || Root.Opcode != D3D10_SB_OPCODE_ADD ||
+        Root.Dest.Kind != OperandKind::Temp || Root.Dest.Mask != 1u ||
+        Root.Sources.size() != 2)
+      continue;
+
+    llvm::SmallVector<uint32_t, 4> MulIndices;
+    llvm::SmallVector<Operand, 4> Work;
+    Work.push_back(Root.Sources[0]);
+    Work.push_back(Root.Sources[1]);
+    unsigned Leaves = 0;
+    while (!Work.empty() && Leaves <= 4) {
+      const Operand Op = Work.pop_back_val();
+      if (Op.Kind == OperandKind::Temp && Op.RelativeRegister == UINT32_MAX &&
+          (Op.Modifier == 0 || Op.Modifier == D3D10_SB_OPERAND_MODIFIER_NEG) &&
+          GetSwizzleLane(Op.Swizzle, 0) == 0 && Op.Index < Defs.size() &&
+          IsSingleUseLocal(Op.Index)) {
+        const auto &D = Defs[Op.Index];
+        if (D.Valid() && !D.IsPhi && !D.IsAux && D.Block == BlockId &&
+            D.Index < I) {
+          const auto &Sub = Block.Insts[D.Index];
+          if (IsScalarAddOrMul(Sub)) {
+            if (Sub.Opcode == D3D10_SB_OPCODE_ADD) {
+              Work.push_back(Sub.Sources[0]);
+              Work.push_back(Sub.Sources[1]);
+              continue;
+            }
+            if (Sub.Opcode == D3D10_SB_OPCODE_MUL) {
+              MulIndices.push_back(D.Index);
+              ++Leaves;
+              continue;
+            }
+          }
+        }
+      }
+      ++Leaves;
+    }
+
+    if (Leaves > 4 || MulIndices.size() < 2)
+      continue;
+    // Mark all MULs that pair with at least one sibling MUL in this dot tree.
+    for (size_t A = 0; A < MulIndices.size(); ++A) {
+      for (size_t B = A + 1; B < MulIndices.size(); ++B) {
+        if (MulPairCompat(Block.Insts[MulIndices[A]],
+                          Block.Insts[MulIndices[B]])) {
+          OutDotMul[MulIndices[A]] = 1;
+          OutDotMul[MulIndices[B]] = 1;
+        }
+      }
+    }
+  }
+}
+
 bool dxcb5::slp::GroupScalarPhis(SsaProgram &Ssa, RemapTable &RemapCache) {
   std::vector<SsaDefSite> Defs;
   Ssa.BuildDefTable(Defs);

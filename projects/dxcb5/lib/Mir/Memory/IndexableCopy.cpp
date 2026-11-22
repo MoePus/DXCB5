@@ -1,5 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptPipeline.h"
+#include "Mir/Memory/MemoryOpt.h"
+#include "Mir/Memory/IndexableSsa.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/TimeProfiler.h"
@@ -59,8 +60,8 @@ void CollectArraySummaries(const SsaProgram &Ssa, const SsaDomTree &Dom,
         A.StoreBlock = B;
       else if (A.StoreBlock != B)
         A.MultiStoreBlock = true;
-      if (Inst.Dest.RelativeRegister != UINT32_MAX || Inst.Saturate ||
-          Inst.Opcode != D3D10_SB_OPCODE_MOV || Inst.Sources.size() != 1)
+      if (Inst.Dest.RelativeRegister != UINT32_MAX ||
+          !idxssa::IsSimpleScalarArrayStore(Inst))
         A.HasDynWrite = true;
     }
   }
@@ -263,7 +264,7 @@ bool ResolveInvariantInitVal(const SsaProgram &Ssa,
         Op.Kind == OperandKind::Input ||
         Op.Kind == OperandKind::ImmediateConstantBuffer) {
       Op.Mask = 1;
-      Op.Swizzle = static_cast<uint8_t>(GetSwizzleLane(Op.Swizzle, 0) * 0x55u);
+      Op.Swizzle = BroadcastLaneSwizzle(GetSwizzleLane(Op.Swizzle, 0));
       Out = Op;
       return true;
     }
@@ -284,7 +285,7 @@ bool ResolveInvariantInitVal(const SsaProgram &Ssa,
     } else {
       const uint8_t NextLane = GetSwizzleLane(Src0.Swizzle, Lane);
       Op = Src0;
-      Op.Swizzle = static_cast<uint8_t>(NextLane * 0x55u);
+      Op.Swizzle = BroadcastLaneSwizzle(NextLane);
     }
   }
   return false;

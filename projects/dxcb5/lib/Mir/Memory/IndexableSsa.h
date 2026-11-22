@@ -47,11 +47,17 @@ inline bool IsSsaSlotValue(const Operand &Val) {
           Val.Kind == OperandKind::Immediate);
 }
 
+// Shared store-shape predicate used by both IndexableCopy and IndexablePlan
+// so array merging and SSA promotion agree on valid scalar array stores (R3).
+inline bool IsSimpleScalarArrayStore(const SsaInst &Inst) {
+  return Inst.Opcode == D3D10_SB_OPCODE_MOV && !Inst.Saturate &&
+         Inst.Sources.size() == 1 && Inst.Dest.Mask == 1 &&
+         IsSsaSlotValue(Inst.Sources[0]);
+}
+
 inline Operand NormalizeScalar(Operand Val) {
-  if (Val.Kind != OperandKind::Immediate) {
-    const uint8_t Lane = static_cast<uint8_t>(Val.Swizzle & 3u);
-    Val.Swizzle = static_cast<uint8_t>(Lane * 0x55u);
-  }
+  if (Val.Kind != OperandKind::Immediate)
+    Val.Swizzle = BroadcastLaneSwizzle(Val.Swizzle & 3u);
   return Val;
 }
 

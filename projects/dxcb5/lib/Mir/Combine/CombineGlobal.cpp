@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/TimeProfiler.h"
@@ -376,133 +376,93 @@ bool MergeDominatingDualDestOps(SsaProgram &Ssa) {
   return Changed;
 }
 
-bool OutputFoldShapeOk(const SsaInst &Prod, const SsaInst &Mov,
-                       bool &NeedsSwizzle) {
-  NeedsSwizzle = false;
-  const auto &Src = Mov.Sources[0];
-  const bool IsDot = Prod.Opcode == D3D10_SB_OPCODE_DP2 ||
-                     Prod.Opcode == D3D10_SB_OPCODE_DP3 ||
-                     Prod.Opcode == D3D10_SB_OPCODE_DP4;
-  if (IsDot) {
-    return PopcountMask(Prod.Dest.Mask) == 1 &&
-           PopcountMask(Mov.Dest.Mask) == 1 &&
-           GetSwizzleLane(Src.Swizzle, FirstActiveLane(Mov.Dest.Mask)) ==
-               FirstActiveLane(Prod.Dest.Mask);
-  }
-  if (!InstructionIsComponentwise(Prod.Opcode))
-    return Prod.Dest.Mask == Mov.Dest.Mask &&
-           IsIdentitySwizzle(Src.Swizzle, Mov.Dest.Mask);
-  if (PopcountMask(Prod.Dest.Mask) != PopcountMask(Mov.Dest.Mask))
+bool FoldSharedDivisorToRcp(AlgContext &Ctx) {
+  if (Ctx.Ssa.NanSafe || Ctx.Ssa.Blocks.empty())
     return false;
-  for (unsigned L = 0; L < kRegisterLanes; ++L) {
-    if (!(Mov.Dest.Mask & (1u << L)))
-      continue;
-    const unsigned SL = GetSwizzleLane(Src.Swizzle, L);
-    if (!(Prod.Dest.Mask & (1u << SL)))
-      return false;
-    if (SL != L)
-      NeedsSwizzle = true;
-  }
-  if (NeedsSwizzle) {
-    for (const auto &PS : Prod.Sources)
-      if (PS.Kind == OperandKind::ImmediateVector)
-        return false;
-  }
-  return true;
-}
-
-bool OutputRangeSafe(const SsaBlock &Block, uint32_t From, uint32_t To,
-                     const Operand &OutDest) {
-  for (uint32_t K = From; K < To; ++K) {
-    const auto &Mid = Block.Insts[K];
-    if (Mid.Dead)
-      continue;
-    if (Mid.Opcode == D3D10_SB_OPCODE_DISCARD)
-      return false;
-    if (Mid.Dest.Kind == OperandKind::Output &&
-        Mid.Dest.Index == OutDest.Index && (Mid.Dest.Mask & OutDest.Mask) != 0)
-      return false;
-  }
-  return true;
-}
-
-bool CrossBlockOutputRangeSafe(const SsaProgram &Ssa, uint32_t FromBlk,
-                               uint32_t FromIdx, uint32_t ToBlk,
-                               uint32_t ToIdx, const Operand &OutDest) {
-  if (FromBlk == ToBlk)
-    return FromIdx < ToIdx &&
-           OutputRangeSafe(Ssa.Blocks[FromBlk], FromIdx + 1, ToIdx, OutDest);
-  if (!OutputRangeSafe(Ssa.Blocks[FromBlk], FromIdx + 1,
-                       static_cast<uint32_t>(Ssa.Blocks[FromBlk].Insts.size()),
-                       OutDest) ||
-      !OutputRangeSafe(Ssa.Blocks[ToBlk], 0, ToIdx, OutDest))
-    return false;
-  std::vector<uint8_t> Visited(Ssa.Blocks.size(), 0);
-  llvm::SmallVector<uint32_t, 32> Work;
-  for (uint32_t S : Ssa.Blocks[FromBlk].Successors)
-    Work.push_back(S);
-  while (!Work.empty()) {
-    const uint32_t Cur = Work.pop_back_val();
-    if (Cur == ToBlk || Cur >= Ssa.Blocks.size() || Visited[Cur])
-      continue;
-    Visited[Cur] = 1;
-    const auto &Blk = Ssa.Blocks[Cur];
-    if (Blk.Kind == FlowKind::Return ||
-        !OutputRangeSafe(Blk, 0, static_cast<uint32_t>(Blk.Insts.size()),
-                         OutDest))
-      return false;
-    for (uint32_t S : Blk.Successors)
-      Work.push_back(S);
-  }
-  return true;
-}
-
-bool SameMergeableOutSrc(const Operand &A, const Operand &B) {
-  if (A.RelativeRegister != UINT32_MAX || B.RelativeRegister != UINT32_MAX ||
-      A.Kind != B.Kind || A.Modifier != B.Modifier)
-    return false;
-  if (A.Kind == OperandKind::Immediate)
-    return A.Index == B.Index;
-  return (A.Kind == OperandKind::Temp || A.Kind == OperandKind::Input ||
-          A.Kind == OperandKind::ConstantBuffer) &&
-         SameOperandBase(A, B);
-}
-
-bool MergeBlockOutputMoves(SsaBlock &Block) {
-  bool Changed = false;
-  for (uint32_t I = 0; I < Block.Insts.size(); ++I) {
-    auto &A = Block.Insts[I];
-    if (A.Dead || A.Opcode != D3D10_SB_OPCODE_MOV ||
-        A.Dest.Kind != OperandKind::Output ||
-        A.Dest.RelativeRegister != UINT32_MAX || A.Sources.size() != 1)
-      continue;
-    for (uint32_t J = I + 1; J < Block.Insts.size(); ++J) {
-      auto &C = Block.Insts[J];
-      if (C.Dead)
+  struct DivSite { uint32_t Block, InstIdx; };
+  struct Key {
+    uint32_t Reg;
+    uint8_t Swz, Mask;
+    bool operator==(const Key &O) const {
+      return Reg == O.Reg && Swz == O.Swz && Mask == O.Mask;
+    }
+  };
+  struct KeyHash {
+    size_t operator()(const Key &K) const {
+      return size_t(K.Reg) * 2654435761u ^ (size_t(K.Swz) << 8) ^ K.Mask;
+    }
+  };
+  std::unordered_map<Key, llvm::SmallVector<DivSite, 4>, KeyHash> Groups;
+  llvm::SmallVector<Key, 16> GroupOrder;
+  for (uint32_t B = 0; B < Ctx.Ssa.Blocks.size(); ++B) {
+    const auto &Blk = Ctx.Ssa.Blocks[B];
+    for (uint32_t I = 0; I < Blk.Insts.size(); ++I) {
+      const auto &Inst = Blk.Insts[I];
+      if (Inst.Dead || Inst.Opcode != D3D10_SB_OPCODE_DIV || Inst.Precise ||
+          Inst.Sources.size() != 2 || Inst.Dest.Kind != OperandKind::Temp ||
+          Inst.Sources[1].Kind != OperandKind::Temp ||
+          Inst.Sources[1].Modifier ||
+          Inst.Sources[1].RelativeRegister != UINT32_MAX)
         continue;
-      if (C.Opcode == D3D10_SB_OPCODE_DISCARD)
-        break;
-      if (C.Dest.Kind == OperandKind::Output && C.Dest.Index == A.Dest.Index &&
-          (C.Dest.Mask & A.Dest.Mask) != 0)
-        break;
-      if (C.Opcode != D3D10_SB_OPCODE_MOV || C.Saturate != A.Saturate ||
-          C.Dest.Kind != OperandKind::Output || C.Dest.Index != A.Dest.Index ||
-          C.Dest.RelativeRegister != UINT32_MAX || C.Sources.size() != 1 ||
-          !SameMergeableOutSrc(A.Sources[0], C.Sources[0]))
+      const auto &DD = Ctx.Defs[Inst.Sources[1].Index];
+      if (DD.Valid() && !DD.IsPhi && !DD.IsAux &&
+          Ctx.Ssa.Blocks[DD.Block].Insts[DD.Index].Opcode == D3D10_SB_OPCODE_SQRT)
         continue;
-      if (C.Sources[0].Kind != OperandKind::Immediate) {
-        for (unsigned L = 0; L < kRegisterLanes; ++L)
-          if (A.Dest.Mask & (1u << L))
-            C.Sources[0].Swizzle = SetSwizzleLane(
-                C.Sources[0].Swizzle, L, GetSwizzleLane(A.Sources[0].Swizzle, L));
-      }
-      C.Dest.Mask |= A.Dest.Mask;
-      A.Dead = true;
-      Changed = true;
-      break;
+      const Key K{Inst.Sources[1].Index, Inst.Sources[1].Swizzle, Inst.Dest.Mask};
+      auto &Vec = Groups[K];
+      if (Vec.empty())
+        GroupOrder.push_back(K);
+      Vec.push_back({B, I});
     }
   }
-  return Changed;
+  SsaDomTree Dom;
+  bool HaveDom = false;
+  for (const Key &K : GroupOrder) {
+    const auto &Sites = Groups[K];
+    if (Sites.size() < 3)
+      continue;
+    if (!HaveDom) {
+      Ctx.Ssa.ComputeDominators(Dom);
+      HaveDom = true;
+    }
+    auto DominatesAll = [&](size_t A) {
+      for (size_t B = 0; B < Sites.size(); ++B) {
+        if (A == B) continue;
+        if (Sites[A].Block == Sites[B].Block ? Sites[A].InstIdx > Sites[B].InstIdx
+                                             : !Dom.Dominates(Sites[A].Block, Sites[B].Block))
+          return false;
+      }
+      return true;
+    };
+    size_t DomPos = Sites.size();
+    for (size_t A = 0; A < Sites.size(); ++A)
+      if (DominatesAll(A)) { DomPos = A; break; }
+    if (DomPos == Sites.size())
+      continue;
+    const uint32_t InsBlk = Sites[DomPos].Block, InsIdx = Sites[DomPos].InstIdx;
+    const uint8_t Mask = K.Mask;
+    const uint8_t Swz = PopcountMask(Mask) == 1
+                            ? BroadcastLaneSwizzle(FirstActiveLane(Mask))
+                            : kIdentitySwizzle;
+    const Operand Denom = Ctx.Ssa.Blocks[InsBlk].Insts[InsIdx].Sources[1];
+    const uint32_t RcpId = Ctx.Ssa.AllocValue();
+    const Operand RcpDst = MakeSsaTemp(RcpId, Mask, Swz);
+    for (const auto &S : Sites) {
+      auto &DivI = Ctx.Ssa.Blocks[S.Block].Insts[S.InstIdx];
+      DivI.Opcode = D3D10_SB_OPCODE_MUL;
+      DivI.Sources[1] = RcpDst;
+    }
+    SsaInst RcpInst;
+    RcpInst.Opcode = D3D11_SB_OPCODE_RCP;
+    RcpInst.Dest = RcpDst;
+    RcpInst.Sources.assign({Denom});
+    auto &Insts = Ctx.Ssa.Blocks[InsBlk].Insts;
+    Insts.insert(Insts.begin() + InsIdx, std::move(RcpInst));
+    Ctx.RefreshBlockAfterInsert(InsBlk, InsIdx);
+    Ctx.Stats.Count[RcpId] = static_cast<uint32_t>(Sites.size());
+    return true;
+  }
+  return false;
 }
 
 } // namespace
@@ -513,61 +473,9 @@ bool dxcb5::alg::RunGlobalAlgebraicFolds(AlgContext &Ctx) {
   bool Changed = false;
   Changed |= FoldMultiUseMulIntoMads(Ctx, Buckets);
   Changed |= FoldMultiUseSqrtIntoRsq(Ctx, Buckets);
+  Changed |= FoldSharedDivisorToRcp(Ctx);
   Changed |= FoldMultiUseDynCbMovs(Ctx, Buckets);
   if (Buckets.SingleDestSinCos >= 2 || Buckets.SingleDestUdiv >= 2)
     Changed |= MergeDominatingDualDestOps(Ctx.Ssa);
-  return Changed;
-}
-
-bool dxcb5::RunOptFoldOutputs(SsaProgram &Ssa) {
-  llvm::TimeTraceScope Scope("DXCB5 Opt Fold Outputs", llvm::StringRef());
-  bool Changed = false;
-  for (auto &Block : Ssa.Blocks)
-    Changed |= MergeBlockOutputMoves(Block);
-  std::vector<SsaDefSite> Defs;
-  Ssa.BuildDefTable(Defs);
-  UseStats Stats;
-  CollectUseStats(Ssa, Stats);
-  for (uint32_t B = 0; B < Ssa.Blocks.size(); ++B) {
-    auto &Block = Ssa.Blocks[B];
-    for (uint32_t I = 0; I < Block.Insts.size(); ++I) {
-      auto &Mov = Block.Insts[I];
-      if (Mov.Dead || Mov.Opcode != D3D10_SB_OPCODE_MOV ||
-          Mov.Dest.Kind != OperandKind::Output ||
-          Mov.Dest.RelativeRegister != UINT32_MAX || Mov.Sources.size() != 1)
-        continue;
-      const auto &Src = Mov.Sources[0];
-      if (Src.Kind != OperandKind::Temp || Src.Modifier ||
-          Src.RelativeRegister != UINT32_MAX || Stats.Count[Src.Index] != 1)
-        continue;
-      const auto &Def = Defs[Src.Index];
-      if (!Def.Valid() || Def.IsPhi || Def.IsAux)
-        continue;
-      auto &Prod = Ssa.Blocks[Def.Block].Insts[Def.Index];
-      if (Prod.Dead || IsPseudoOpcode(Prod.Opcode) || !Prod.IsPure() ||
-          Prod.HasAuxDest() || Prod.Dest.Kind != OperandKind::Temp ||
-          Prod.Dest.Index != Src.Index)
-        continue;
-      if (Mov.Saturate && !InstructionSupportsSaturate(Prod.Opcode))
-        continue;
-      bool NeedsSwizzle = false;
-      if (!OutputFoldShapeOk(Prod, Mov, NeedsSwizzle) ||
-          !CrossBlockOutputRangeSafe(Ssa, Def.Block, Def.Index, B, I, Mov.Dest))
-        continue;
-      if (NeedsSwizzle) {
-        for (auto &PS : Prod.Sources)
-          if (PS.Kind != OperandKind::Immediate &&
-              PS.Kind != OperandKind::ImmediateVector)
-            PS.Swizzle = ComposeSwizzle(PS.Swizzle, Src.Swizzle);
-      }
-      Prod.Dest = Mov.Dest;
-      if (Mov.Saturate)
-        Prod.Saturate = true;
-      Mov.Dead = true;
-      Changed = true;
-    }
-  }
-  if (Changed)
-    Ssa.CompactDead();
   return Changed;
 }

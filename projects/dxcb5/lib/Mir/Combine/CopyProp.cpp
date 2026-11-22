@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/TimeProfiler.h"
 #include <array>
@@ -162,42 +162,55 @@ bool TrySimplifyCombineVec(SsaProgram &Ssa, SsaInst &Inst, Operand &OutRepl) {
       Inst.Sources.empty())
     return false;
   const unsigned W = static_cast<unsigned>(Inst.Sources.size());
+  const uint8_t Active = static_cast<uint8_t>(Inst.Dest.Mask & ((1u << W) - 1u));
+  if (!Active)
+    return false;
   bool AllImm = true;
   bool SameImm = true;
+  bool HaveImm = false;
+  uint32_t FirstImm = 0;
   std::array<uint32_t, 4> Bits{};
   for (unsigned L = 0; L < W; ++L) {
+    if (!(Active & (1u << L)))
+      continue;
     if (Inst.Sources[L].Kind != OperandKind::Immediate ||
         Inst.Sources[L].Modifier) {
       AllImm = false;
       break;
     }
     Bits[L] = Inst.Sources[L].Index;
-    if (L && Bits[L] != Bits[0])
+    if (!HaveImm) {
+      FirstImm = Bits[L];
+      HaveImm = true;
+    } else if (Bits[L] != FirstImm) {
       SameImm = false;
+    }
   }
   if (AllImm) {
     if (SameImm) {
-      OutRepl = MakeImm(Bits[0]);
+      OutRepl = MakeImm(FirstImm);
       return true;
     }
     OutRepl = {OperandKind::ImmediateVector, Ssa.InternLiteralVector(Bits), 0,
-               Inst.Dest.Mask, kIdentitySwizzle};
+               Active, kIdentitySwizzle};
     return true;
   }
-  const auto &First = Inst.Sources[0];
+  const unsigned FirstL = FirstActiveLane(Active);
+  const auto &First = Inst.Sources[FirstL];
   if (First.Kind != OperandKind::Temp && First.Kind != OperandKind::Input &&
       First.Kind != OperandKind::ConstantBuffer)
     return false;
-  for (unsigned L = 1; L < W; ++L)
-    if (!SameOperandBase(First, Inst.Sources[L]))
+  for (unsigned L = FirstL + 1; L < W; ++L)
+    if ((Active & (1u << L)) && !SameOperandBase(First, Inst.Sources[L]))
       return false;
   Operand Direct = First;
-  Direct.Mask = Inst.Dest.Mask;
+  Direct.Mask = Active;
   uint8_t Swz = 0;
   const unsigned Fallback = GetSwizzleLane(First.Swizzle, 0);
   for (unsigned L = 0; L < kRegisterLanes; ++L) {
-    const unsigned Src =
-        L < W ? GetSwizzleLane(Inst.Sources[L].Swizzle, 0) : Fallback;
+    const unsigned Src = (L < W && (Active & (1u << L)))
+                             ? GetSwizzleLane(Inst.Sources[L].Swizzle, 0)
+                             : Fallback;
     Swz = SetSwizzleLane(Swz, L, Src);
   }
   Direct.Swizzle = Swz;

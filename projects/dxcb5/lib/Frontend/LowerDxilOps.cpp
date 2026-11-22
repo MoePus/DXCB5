@@ -124,6 +124,8 @@ bool SsaLowerer::Handle(Value *V, Operand &Result, Kind *Resource,
   OperandKind OperandType;
   switch (static_cast<DXIL::ResourceClass>(Class->getZExtValue())) {
   case DXIL::ResourceClass::SRV: {
+    if (Range >= Module.GetSRVs().size())
+      return Fail("SM5 SRV range ID out of bounds");
     const auto &Texture = Module.GetSRV(Range);
     Binding = &Texture;
     if (Resource) *Resource = Texture.GetKind();
@@ -133,6 +135,8 @@ bool SsaLowerer::Handle(Value *V, Operand &Result, Kind *Resource,
     break;
   }
   case DXIL::ResourceClass::UAV: {
+    if (Range >= Module.GetUAVs().size())
+      return Fail("SM5 UAV range ID out of bounds");
     const auto &Uav = Module.GetUAV(Range);
     Binding = &Uav;
     if (Resource) *Resource = Uav.GetKind();
@@ -142,10 +146,14 @@ bool SsaLowerer::Handle(Value *V, Operand &Result, Kind *Resource,
     break;
   }
   case DXIL::ResourceClass::Sampler:
+    if (Range >= Module.GetSamplers().size())
+      return Fail("SM5 sampler range ID out of bounds");
     Binding = &Module.GetSampler(Range);
     OperandType = OperandKind::Sampler;
     break;
   case DXIL::ResourceClass::CBuffer:
+    if (Range >= Module.GetCBuffers().size())
+      return Fail("SM5 cbuffer range ID out of bounds");
     Binding = &Module.GetCBuffer(Range);
     OperandType = OperandKind::ConstantBuffer;
     break;
@@ -232,6 +240,15 @@ bool SsaLowerer::BindValue(llvm::Instruction &Inst) {
     }
     return Fail("SV_SampleIndex input is missing from signature");
   }
+  if (Opcode == Op::CBufferLoadLegacy) {
+    if (const auto *RetST = dyn_cast<StructType>(Inst.getType())) {
+      if (RetST->getNumElements() > 4 ||
+          (RetST->getNumElements() > 0 &&
+           !RetST->getElementType(0)->isFloatTy() &&
+           !RetST->getElementType(0)->isIntegerTy(32)))
+        return Fail("non-32-bit SM5 cbuffer load is unsupported");
+    }
+  }
   const auto *Row =
       Opcode == Op::CBufferLoadLegacy ? IntArg(*Call, 2) : nullptr;
   if (Row) {
@@ -247,8 +264,11 @@ bool SsaLowerer::BindValue(llvm::Instruction &Inst) {
   uint8_t Mask = 1;
   if (Inst.getType()->isStructTy())
     Mask = 0xfu;
-  else if (const auto *VT = dyn_cast<VectorType>(Inst.getType()))
+  else if (const auto *VT = dyn_cast<VectorType>(Inst.getType())) {
+    if (VT->getNumElements() == 0 || VT->getNumElements() > kRegisterLanes)
+      return Fail("vector width exceeds SM5 4-lane register limit");
     Mask = MaskForWidth(VT->getNumElements());
+  }
   Values[&Inst] = AllocTemp(Mask);
   return true;
 }
@@ -279,8 +299,19 @@ bool SsaLowerer::LowerMath(CallInst &Call, unsigned OpNumber) {
   for (const auto &Entry : kMathTable) {
     if (Entry.Dxil != Opcode)
       continue;
-    const bool SignedInt = Opcode == Op::IMin || Opcode == Op::IMax;
-    const bool UnsignedInt = Opcode == Op::UMin || Opcode == Op::UMax;
+    if (Opcode == Op::Bfrev || Opcode == Op::FirstbitHi ||
+        Opcode == Op::FirstbitSHi) {
+      const Type *ArgTy = Call.getArgOperand(1)->getType();
+      if (!ArgTy->isIntegerTy(32))
+        return Fail("non-32-bit bit-scan/reverse intrinsic is unsupported in SM5");
+    }
+    const bool SignedInt =
+        Opcode == Op::IMin || Opcode == Op::IMax ||
+        Opcode == Op::FirstbitSHi || Opcode == Op::IMad;
+    const bool UnsignedInt =
+        Opcode == Op::UMin || Opcode == Op::UMax || Opcode == Op::Bfrev ||
+        Opcode == Op::Countbits || Opcode == Op::FirstbitLo ||
+        Opcode == Op::FirstbitHi || Opcode == Op::UMad || Opcode == Op::Bfi;
     SmallVector<Operand, 4> Sources;
     for (unsigned I = 1; I <= Entry.Sources; ++I) {
       const Value *Arg = Call.getArgOperand(I);
@@ -364,16 +395,18 @@ bool SsaLowerer::LowerEvalAttribute(CallInst &Call, unsigned OpNumber) {
 
 bool SsaLowerer::AddLocalConstant(const GlobalVariable &Global, uint32_t &Base,
                                   unsigned Width) {
-  auto Match = LocalConstants.find(&Global);
+  const auto *Init = Global.getInitializer();
+  auto *Array = Init ? dyn_cast<ArrayType>(Init->getType()) : nullptr;
+  unsigned ElemWidth = 1;
+  if (!Array || !IsScalarOrVec32(Array->getElementType(), ElemWidth))
+    return Fail("SM5 local constants require an array of 32-bit scalars or vectors");
+  const unsigned KeyWidth = ElemWidth > 1 ? 0u : Width;
+  const std::pair<const GlobalVariable *, unsigned> CacheKey{&Global, KeyWidth};
+  auto Match = LocalConstants.find(CacheKey);
   if (Match != LocalConstants.end()) {
     Base = Match->second;
     return true;
   }
-  const auto *Init = Global.getInitializer();
-  auto *Array = dyn_cast<ArrayType>(Init->getType());
-  unsigned ElemWidth = 1;
-  if (!Array || !IsScalarOrVec32(Array->getElementType(), ElemWidth))
-    return Fail("SM5 local constants require an array of 32-bit scalars or vectors");
   Base = static_cast<uint32_t>(Ssa.Mir.ImmediateConstants.size() /
                                kImmediateConstantLanes);
   const auto Count = Array->getNumElements();
@@ -389,10 +422,12 @@ bool SsaLowerer::AddLocalConstant(const GlobalVariable &Global, uint32_t &Base,
             Source(Elt).Index;
       }
     }
-    LocalConstants[&Global] = Base;
+    LocalConstants[CacheKey] = Base;
     return Error.empty();
   }
-  const auto Rows = Count / Width;
+  if (Width == 0 || Width > kImmediateConstantLanes)
+    return Fail("invalid local constant pack width");
+  const auto Rows = (Count + Width - 1) / Width;
   if (Rows > kMaxImmediateScalarRows - Base)
     return Fail("local constants exceed the SM5 immediate constant buffer");
   Ssa.Mir.ImmediateConstants.resize((Base + Rows) * kImmediateConstantLanes);
@@ -403,7 +438,7 @@ bool SsaLowerer::AddLocalConstant(const GlobalVariable &Global, uint32_t &Base,
     Ssa.Mir.ImmediateConstants[Row * kImmediateConstantLanes + Lane] =
         Source(V).Index;
   }
-  LocalConstants[&Global] = Base;
+  LocalConstants[CacheKey] = Base;
   return Error.empty();
 }
 
@@ -422,6 +457,7 @@ bool SsaLowerer::LowerLocalConstant(LoadInst &Load) {
         static_cast<uint8_t>(kIdentitySwizzle & ((1u << (2 * Tuple.Width)) - 1));
     auto Dest = Values.lookup(&Load);
     Dest.Mask = MaskForWidth(Tuple.Width);
+    Dest.Swizzle = kIdentitySwizzle;
     Emit(D3D10_SB_OPCODE_MOV, Dest, {Input});
     return Error.empty();
   }

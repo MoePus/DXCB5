@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptAlgebraicCommon.h"
+#include "Mir/Combine/CombineCommon.h"
 #include "llvm/ADT/SmallVector.h"
 #include <array>
 
@@ -430,7 +430,7 @@ bool SimplifyMulInst(AlgContext &Ctx, uint32_t B, uint32_t &I) {
       Inst.Sources.assign({Other});
       return true;
     }
-    if (IsZeroFloatImm(Inst.Sources[Side])) {
+    if (!Ctx.Ssa.NanSafe && IsZeroFloatImm(Inst.Sources[Side])) {
       Inst.Opcode = D3D10_SB_OPCODE_MOV;
       Inst.Sources.assign({MakeImm(kPosZeroBits)});
       return true;
@@ -484,7 +484,7 @@ bool dxcb5::alg::SimplifyFloatInst(AlgContext &Ctx, uint32_t B, uint32_t &I) {
   case D3D10_SB_OPCODE_MAD: return SimplifyMadInst(Ctx, Inst);
   case D3D10_SB_OPCODE_MAX:
   case D3D10_SB_OPCODE_MIN: return SimplifyMinMaxInst(Ctx, Inst);
-  case D3D10_SB_OPCODE_EXP: return SimplifyExpInst(Ctx, Inst);
+  case D3D10_SB_OPCODE_EXP: return SimplifyExpInst(Ctx, B, I);
   case D3D10_SB_OPCODE_DIV: return SimplifyDivInst(Ctx, B, Inst);
   case D3D10_SB_OPCODE_RSQ:
   case D3D10_SB_OPCODE_SQRT:
@@ -496,6 +496,56 @@ bool dxcb5::alg::SimplifyFloatInst(AlgContext &Ctx, uint32_t B, uint32_t &I) {
       return true;
     }
     return false;
+  }
+  case D3D10_SB_OPCODE_LT: {
+    if (!Inst.Precise && Inst.Sources.size() == 2 &&
+        IsZeroFloatImm(Inst.Sources[1]) &&
+        IsKnownNonNegativeFloat(Ctx, Inst.Sources[0], Inst.Dest.Mask,
+                                /*AllowNegZero=*/true)) {
+      Inst.Opcode = D3D10_SB_OPCODE_MOV;
+      Inst.Sources.assign({MakeImm(0u)});
+      return true;
+    }
+    return false;
+  }
+  case D3D10_SB_OPCODE_GE: {
+    if (!Inst.Precise && !Ctx.Ssa.NanSafe && Inst.Sources.size() == 2 &&
+        IsZeroFloatImm(Inst.Sources[1]) &&
+        IsKnownNonNegativeFloat(Ctx, Inst.Sources[0], Inst.Dest.Mask,
+                                /*AllowNegZero=*/true)) {
+      Inst.Opcode = D3D10_SB_OPCODE_MOV;
+      Inst.Sources.assign({MakeImm(0xffffffffu)});
+      return true;
+    }
+    return false;
+  }
+  case D3D10_SB_OPCODE_DERIV_RTX:
+  case D3D10_SB_OPCODE_DERIV_RTY:
+  case D3D11_SB_OPCODE_DERIV_RTX_COARSE:
+  case D3D11_SB_OPCODE_DERIV_RTX_FINE:
+  case D3D11_SB_OPCODE_DERIV_RTY_COARSE:
+  case D3D11_SB_OPCODE_DERIV_RTY_FINE: {
+    if (Inst.Sources.size() != 1)
+      return false;
+    const auto &S = Inst.Sources[0];
+    bool AllFinite = false;
+    if (S.Kind == OperandKind::Immediate) {
+      AllFinite = std::isfinite(BitsToFloat(ApplyFloatModToBits(S.Index, S.Modifier)));
+    } else if (S.Kind == OperandKind::ImmediateVector &&
+               S.Index < Ctx.Ssa.Mir.LiteralVectors.size()) {
+      const auto &Arr = Ctx.Ssa.Mir.LiteralVectors[S.Index];
+      AllFinite = true;
+      for (unsigned L = 0; L < kRegisterLanes; ++L)
+        if ((Inst.Dest.Mask & (1u << L)) &&
+            !std::isfinite(BitsToFloat(
+                ApplyFloatModToBits(Arr[GetSwizzleLane(S.Swizzle, L)], S.Modifier))))
+          AllFinite = false;
+    }
+    if (!AllFinite)
+      return false;
+    Inst.Opcode = D3D10_SB_OPCODE_MOV;
+    Inst.Sources.assign({MakeImm(kPosZeroBits)});
+    return true;
   }
   default: return false;
   }

@@ -1,5 +1,5 @@
 // Distributed under the University of Illinois Open Source License.
-#include "Mir/OptIndexableSsa.h"
+#include "Mir/Memory/IndexableSsa.h"
 #include <algorithm>
 
 using namespace dxcb5;
@@ -47,23 +47,24 @@ void ScanInstAccesses(const SsaProgram &Ssa, const SsaDomTree &Dom, uint32_t B,
     ++St.DynLoads;
     St.DynLoadLca =
         St.DynLoadLca == UINT32_MAX ? B : DomLCA(Dom, St.DynLoadLca, B);
-    if (Inst.Opcode != D3D10_SB_OPCODE_MOV || Inst.Saturate ||
-        Inst.Sources.size() != 1 || Inst.Dest.Kind != OperandKind::Temp ||
+    if (Src.Element != 0 || Inst.Opcode != D3D10_SB_OPCODE_MOV ||
+        Inst.Saturate || Inst.Sources.size() != 1 ||
+        Inst.Dest.Kind != OperandKind::Temp ||
         PopcountMask(Inst.Dest.Mask) != 1)
       St.BadAccess = true;
   }
   if (Inst.Dest.Kind != OperandKind::IndexableTemp || Inst.Dest.Index >= NumX)
     return;
   auto &St = Stats[Inst.Dest.Index];
-  if (Inst.Opcode != D3D10_SB_OPCODE_MOV || Inst.Saturate ||
-      Inst.Sources.size() != 1 || Inst.Dest.Mask != 1 ||
-      !IsSsaSlotValue(Inst.Sources[0])) {
+  if (!IsSimpleScalarArrayStore(Inst)) {
     St.BadAccess = true;
     return;
   }
-  if (Inst.Dest.RelativeRegister != UINT32_MAX)
+  if (Inst.Dest.RelativeRegister != UINT32_MAX) {
+    if (Inst.Dest.Element != 0)
+      St.BadAccess = true;
     ++St.DynStores;
-  else if (Inst.Dest.Element >= Ssa.Mir.IndexableTemps[Inst.Dest.Index].Elements)
+  } else if (Inst.Dest.Element >= Ssa.Mir.IndexableTemps[Inst.Dest.Index].Elements)
     St.BadAccess = true;
   else
     ++St.ConstStores;

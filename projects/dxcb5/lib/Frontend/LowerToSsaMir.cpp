@@ -241,6 +241,10 @@ Operand SsaLowerer::Source(const Value *V) {
       return MakeImm(Bits);
     if (const auto *VT = dyn_cast<VectorType>(C->getType())) {
       const unsigned W = VT->getNumElements();
+      if (W == 0 || W > kRegisterLanes) {
+        Fail("unsupported vector constant width in SM5");
+        return MakeImm(0);
+      }
       std::array<uint32_t, 4> Lanes{};
       bool AllEqual = true;
       for (unsigned Lane = 0; Lane < W; ++Lane) {
@@ -301,7 +305,7 @@ Operand SsaLowerer::SourceScalarLane(const Value *V, unsigned Lane) {
 }
 
 Operand SsaLowerer::RelativeIndex(const Value *V) {
-  auto Index = Source(V);
+  auto Index = SourceInt(V, false, false);
   if (Index.Kind == OperandKind::Temp && !Index.Modifier)
     return Index;
   auto Reg = AllocTemp(1);
@@ -310,7 +314,10 @@ Operand SsaLowerer::RelativeIndex(const Value *V) {
 }
 
 Operand SsaLowerer::CombineOperands(ArrayRef<Operand> Lanes, bool Precise) {
-  assert(!Lanes.empty() && Lanes.size() <= kRegisterLanes);
+  if (Lanes.empty() || Lanes.size() > kRegisterLanes) {
+    Fail("combined vector width exceeds SM5 4-lane register limit");
+    return MakeImm(0);
+  }
   if (Lanes.size() == 1)
     return Lanes[0];
   Operand Direct;
@@ -477,7 +484,10 @@ bool SsaLowerer::LowerBlockPhis(BasicBlock &Block, SsaBlock &Out) {
 
 bool SsaLowerer::Run(ArrayRef<VectorPhiGroup> PhiGroups) {
   TimeTraceScope Scope("DXCB5 Lower To SSA MIR", StringRef());
-  auto &Entry = *Module.GetEntryFunction();
+  Function *EntryPtr = Module.GetEntryFunction();
+  if (!EntryPtr)
+    return Fail("DXIL module has no entry function");
+  auto &Entry = *EntryPtr;
   Ssa.Blocks.resize(Entry.size());
 
   uint32_t NextBlock = 0;

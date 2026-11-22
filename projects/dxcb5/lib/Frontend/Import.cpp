@@ -132,7 +132,7 @@ bool ImportSignature(const DxilSignature &Source,
       if (LinkPixel) {
         if (!LinkInput(Out, Vertex, Next, Error))
           return false;
-      } else {
+      } else if (Element->IsAllocated()) {
         Out.UsedMask = (Out.UsedMask << Element->GetStartCol()) & Out.Mask;
       }
       if (Out.Register >= RegisterCount) {
@@ -391,13 +391,24 @@ void ImportShaderResource(const DxilResourceBase &Resource, BoundResource Bindin
 }
 
 uint32_t ResourceReturnType(DXIL::ComponentType Component) {
-  if (Component == DXIL::ComponentType::U32 ||
-      Component == DXIL::ComponentType::U16)
+  switch (Component) {
+  case DXIL::ComponentType::UNormF16:
+  case DXIL::ComponentType::UNormF32:
+  case DXIL::ComponentType::UNormF64:
+    return D3D_RETURN_TYPE_UNORM;
+  case DXIL::ComponentType::SNormF16:
+  case DXIL::ComponentType::SNormF32:
+  case DXIL::ComponentType::SNormF64:
+    return D3D_RETURN_TYPE_SNORM;
+  case DXIL::ComponentType::U32:
+  case DXIL::ComponentType::U16:
     return D3D_RETURN_TYPE_UINT;
-  if (Component == DXIL::ComponentType::I32 ||
-      Component == DXIL::ComponentType::I16)
+  case DXIL::ComponentType::I32:
+  case DXIL::ComponentType::I16:
     return D3D_RETURN_TYPE_SINT;
-  return D3D_RETURN_TYPE_FLOAT;
+  default:
+    return D3D_RETURN_TYPE_FLOAT;
+  }
 }
 
 bool ImportUAVs(DxilModule &Module, MirProgram &Program, Interface &Layout,
@@ -509,7 +520,12 @@ bool ImportResources(DxilModule &Module, MirProgram &Program, Interface &Layout,
 bool dxcb5::ImportInterface(DxilModule &Module, ArrayRef<SignatureElement> Vertex,
                             MirProgram &Program, Interface &Layout,
                             std::string &Error) {
-  const bool Pixel = Module.GetShaderModel()->IsPS();
+  const auto *SM = Module.GetShaderModel();
+  if (!SM || (!SM->IsPS() && !SM->IsVS())) {
+    Error = "DXCB5 only supports vs_5_0 and ps_5_0 shader stages";
+    return false;
+  }
+  const bool Pixel = SM->IsPS();
   Program.ShaderStage = Pixel ? Stage::Pixel : Stage::Vertex;
   const auto InputRegisters = Pixel ? D3D11_PS_INPUT_REGISTER_COUNT
                                     : D3D11_VS_INPUT_REGISTER_COUNT;
