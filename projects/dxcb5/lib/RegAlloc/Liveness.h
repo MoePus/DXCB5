@@ -66,6 +66,12 @@ inline bool HasCondition(const FlowBlock &Block) {
 bool ComputeLiveness(llvm::ArrayRef<FlowBlock> Blocks, uint32_t TempCount,
                      LivenessResult &Result);
 
+// Exact intra-block peak live scalar lanes (PL) over post-OOSSA FlowBlocks.
+uint32_t ComputeExactPeakLanes(llvm::ArrayRef<FlowBlock> Blocks,
+                               uint32_t TempCount,
+                               const LivenessResult *CachedLive = nullptr,
+                               std::vector<uint32_t> *OutBlockPeaks = nullptr);
+
 // Combined destination mask across all non-null destination operands of Inst.
 uint8_t CombinedInstructionDestMask(const Instruction &Inst);
 

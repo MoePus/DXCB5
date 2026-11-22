@@ -20,7 +20,8 @@ constexpr uint32_t kNoSlot = UINT32_MAX;
 // so extreme shaders up to kMaxGraphSlots avoid a 72 MiB dense allocation.
 constexpr size_t kDenseGraphSlotLimit = 10240;
 constexpr size_t kMaxGraphSlots = 24576;
-constexpr uint32_t kShaderTempLimit = 4096;
+constexpr uint32_t kControlFlowReservedTemps = 3;
+constexpr uint32_t kShaderTempLimit = 4096 - kControlFlowReservedTemps;
 
 class SparseSlotState {
 public:

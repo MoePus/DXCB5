@@ -130,8 +130,17 @@ bool ResolveParallelCopies(const std::vector<ParallelCopy> &Copies,
     }
     if (!SavedAny) {
       const auto Saved = DestinationKey(First);
-      const auto ScratchKey = Key(Scratch, 0);
-      Result.emplace_back(Scratch, TempSource(Saved), 0);
+      uint8_t FreeLane = static_cast<uint8_t>(RegisterLanes);
+      for (uint8_t L = 0; L < RegisterLanes; ++L) {
+        if (Reads[Key(Scratch, L)] == 0) {
+          FreeLane = L;
+          break;
+        }
+      }
+      if (FreeLane >= RegisterLanes)
+        return false;
+      const auto ScratchKey = Key(Scratch, FreeLane);
+      Result.emplace_back(Scratch, TempSource(Saved), FreeLane);
       for (auto &P : Pending) {
         if (P.ReadsTemp() && SourceKey(P) == Saved)
           P.Source = TempSource(ScratchKey);
@@ -141,7 +150,8 @@ bool ResolveParallelCopies(const std::vector<ParallelCopy> &Copies,
     }
   }
 
-  assert(VerifyParallelCopies(Copies, Scratch, Result));
+  if (!VerifyParallelCopies(Copies, Scratch, Result))
+    return false;
   Sequence = std::move(Result);
   return true;
 }

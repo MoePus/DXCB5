@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <map>
 #include <tuple>
 
 using namespace hlsl;
@@ -167,13 +168,52 @@ uint32_t ResourceFlags(const BoundResource &resource) {
   return resource.Comparison ? D3D_SIF_COMPARISON_SAMPLER : 0u;
 }
 
-uint32_t WriteType(BytePart &out, const ConstantVariable &variable) {
+struct RdefMemberKey {
+  std::string Name;
+  uint32_t TypeOffset;
+  uint32_t Offset;
+  bool operator<(const RdefMemberKey &other) const {
+    return std::tie(TypeOffset, Offset, Name) <
+           std::tie(other.TypeOffset, other.Offset, other.Name);
+  }
+};
+
+struct RdefTypeKey {
+  uint16_t Class;
+  uint16_t Type;
+  uint16_t Rows;
+  uint16_t Columns;
+  uint16_t Elements;
+  std::string TypeName;
+  std::vector<RdefMemberKey> Members;
+  bool operator<(const RdefTypeKey &other) const {
+    return std::tie(Class, Type, Rows, Columns, Elements, TypeName, Members) <
+           std::tie(other.Class, other.Type, other.Rows, other.Columns,
+                    other.Elements, other.TypeName, other.Members);
+  }
+};
+
+using RdefTypeCache = std::map<RdefTypeKey, uint32_t>;
+
+uint32_t WriteType(BytePart &out, const ConstantVariable &variable,
+                   RdefTypeCache &typeCache) {
+  RdefTypeKey key{variable.Class, variable.Type, variable.Rows,
+                  variable.Columns, variable.Elements, variable.TypeName, {}};
+  key.Members.reserve(variable.Members.size());
+  for (const auto &member : variable.Members) {
+    key.Members.push_back(
+        {member.Name, WriteType(out, member, typeCache), member.Offset});
+  }
+  auto it = typeCache.find(key);
+  if (it != typeCache.end())
+    return it->second;
+
   struct MemberDesc { uint32_t Name, Type, Offset; };
   std::vector<MemberDesc> members;
-  members.reserve(variable.Members.size());
-  for (const auto &member : variable.Members) {
+  members.reserve(key.Members.size());
+  for (const auto &member : key.Members) {
     const auto name = out.AppendString(member.Name);
-    members.push_back({name, WriteType(out, member), member.Offset});
+    members.push_back({name, member.TypeOffset, member.Offset});
   }
   const auto name = variable.TypeName.empty() ? 0 : out.AppendString(variable.TypeName);
   out.Align();
@@ -185,11 +225,12 @@ uint32_t WriteType(BytePart &out, const ConstantVariable &variable) {
                   PackedType(variable.Rows, variable.Columns),
                   PackedType(variable.Elements, static_cast<uint16_t>(members.size())),
                   fields, 0, 0, 0, 0, name});
+  typeCache.emplace(std::move(key), type);
   return type;
 }
 
 void WriteVariables(BytePart &out, const ConstantBuffer &buffer,
-                    uint32_t descriptor) {
+                    uint32_t descriptor, RdefTypeCache &typeCache) {
   const auto firstVariable = out.Size();
   out.PatchWord(descriptor + 8, buffer.Variables.empty() ? 0 : firstVariable);
   for (const auto &variable : buffer.Variables) {
@@ -201,7 +242,7 @@ void WriteVariables(BytePart &out, const ConstantBuffer &buffer,
   for (const auto &variable : buffer.Variables) {
     out.PatchWord(offset, out.AppendString(variable.Name));
     out.Align();
-    out.PatchWord(offset + 16, WriteType(out, variable));
+    out.PatchWord(offset + 16, WriteType(out, variable, typeCache));
     if (!variable.DefaultValue.empty())
       out.PatchWord(offset + 20, out.AppendBytes(variable.DefaultValue));
     offset += RdefVariableSize;
@@ -313,13 +354,14 @@ std::vector<uint8_t> EncodeResourceDefinitions(const MirProgram &program) {
     out.WriteWords({0, static_cast<uint32_t>(buffer.Variables.size()), 0,
                     buffer.Size, 0, D3D_CT_CBUFFER});
   }
+  RdefTypeCache typeCache;
   uint32_t binding = RdefHeaderSize, descriptor = firstBuffer;
   for (const auto &buffer : program.ConstantBuffers) {
     const auto name = out.AppendString(buffer.Name);
     out.PatchWord(binding, name);
     out.PatchWord(descriptor, name);
     out.Align();
-    WriteVariables(out, buffer, descriptor);
+    WriteVariables(out, buffer, descriptor, typeCache);
     binding += RdefBindingSize;
     descriptor += RdefBufferSize;
   }
@@ -370,7 +412,60 @@ std::vector<uint8_t> EncodeStatistics(const MirProgram &program) {
       ++stats[16]; break;
     case D3D10_SB_OPCODE_SAMPLE_B: ++stats[17]; break;
     case D3D10_SB_OPCODE_SAMPLE_D: ++stats[18]; break;
-    default: ++stats[4]; break;
+    case D3D10_SB_OPCODE_ADD: case D3D10_SB_OPCODE_DIV:
+    case D3D10_SB_OPCODE_DP2: case D3D10_SB_OPCODE_DP3:
+    case D3D10_SB_OPCODE_DP4: case D3D10_SB_OPCODE_EQ:
+    case D3D10_SB_OPCODE_EXP: case D3D10_SB_OPCODE_FRC:
+    case D3D10_SB_OPCODE_GE: case D3D10_SB_OPCODE_LOG:
+    case D3D10_SB_OPCODE_LT: case D3D10_SB_OPCODE_MAD:
+    case D3D10_SB_OPCODE_MIN: case D3D10_SB_OPCODE_MAX:
+    case D3D10_SB_OPCODE_MUL: case D3D10_SB_OPCODE_NE:
+    case D3D10_SB_OPCODE_ROUND_NE: case D3D10_SB_OPCODE_ROUND_NI:
+    case D3D10_SB_OPCODE_ROUND_PI: case D3D10_SB_OPCODE_ROUND_Z:
+    case D3D10_SB_OPCODE_RSQ: case D3D10_SB_OPCODE_SINCOS:
+    case D3D10_SB_OPCODE_SQRT: case D3D11_SB_OPCODE_RCP:
+    case D3D10_SB_OPCODE_DERIV_RTX: case D3D10_SB_OPCODE_DERIV_RTY:
+    case D3D11_SB_OPCODE_DERIV_RTX_COARSE: case D3D11_SB_OPCODE_DERIV_RTX_FINE:
+    case D3D11_SB_OPCODE_DERIV_RTY_COARSE: case D3D11_SB_OPCODE_DERIV_RTY_FINE:
+      ++stats[4]; break;
+    case D3D10_SB_OPCODE_IADD: case D3D10_SB_OPCODE_IEQ:
+    case D3D10_SB_OPCODE_IGE: case D3D10_SB_OPCODE_ILT:
+    case D3D10_SB_OPCODE_IMAD: case D3D10_SB_OPCODE_IMAX:
+    case D3D10_SB_OPCODE_IMIN: case D3D10_SB_OPCODE_IMUL:
+    case D3D10_SB_OPCODE_INE: case D3D10_SB_OPCODE_INEG:
+    case D3D10_SB_OPCODE_ISHL: case D3D10_SB_OPCODE_ISHR:
+    case D3D11_SB_OPCODE_IBFE: case D3D11_SB_OPCODE_FIRSTBIT_SHI:
+      ++stats[5]; break;
+    case D3D10_SB_OPCODE_AND: case D3D10_SB_OPCODE_NOT:
+    case D3D10_SB_OPCODE_OR: case D3D10_SB_OPCODE_XOR:
+    case D3D10_SB_OPCODE_UDIV: case D3D10_SB_OPCODE_UGE:
+    case D3D10_SB_OPCODE_ULT: case D3D10_SB_OPCODE_UMAD:
+    case D3D10_SB_OPCODE_UMAX: case D3D10_SB_OPCODE_UMIN:
+    case D3D10_SB_OPCODE_UMUL: case D3D10_SB_OPCODE_USHR:
+    case D3D11_SB_OPCODE_BFI: case D3D11_SB_OPCODE_BFREV:
+    case D3D11_SB_OPCODE_COUNTBITS: case D3D11_SB_OPCODE_FIRSTBIT_HI:
+    case D3D11_SB_OPCODE_FIRSTBIT_LO: case D3D11_SB_OPCODE_UBFE:
+    case D3D11_SB_OPCODE_UADDC: case D3D11_SB_OPCODE_USUBB:
+      ++stats[6]; break;
+    case D3D11_SB_OPCODE_SYNC:
+      ++stats[34]; break;
+    case D3D11_SB_OPCODE_ATOMIC_AND: case D3D11_SB_OPCODE_ATOMIC_OR:
+    case D3D11_SB_OPCODE_ATOMIC_XOR: case D3D11_SB_OPCODE_ATOMIC_CMP_STORE:
+    case D3D11_SB_OPCODE_ATOMIC_IADD: case D3D11_SB_OPCODE_ATOMIC_IMAX:
+    case D3D11_SB_OPCODE_ATOMIC_IMIN: case D3D11_SB_OPCODE_ATOMIC_UMAX:
+    case D3D11_SB_OPCODE_ATOMIC_UMIN: case D3D11_SB_OPCODE_IMM_ATOMIC_IADD:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_AND: case D3D11_SB_OPCODE_IMM_ATOMIC_OR:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_XOR: case D3D11_SB_OPCODE_IMM_ATOMIC_EXCH:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_CMP_EXCH:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_IMAX: case D3D11_SB_OPCODE_IMM_ATOMIC_IMIN:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_UMAX: case D3D11_SB_OPCODE_IMM_ATOMIC_UMIN:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_ALLOC:
+    case D3D11_SB_OPCODE_IMM_ATOMIC_CONSUME:
+      ++stats[35]; break;
+    case D3D11_SB_OPCODE_STORE_UAV_TYPED: case D3D11_SB_OPCODE_STORE_RAW:
+    case D3D11_SB_OPCODE_STORE_STRUCTURED:
+      ++stats[36]; break;
+    default: break;
     }
   }
   std::vector<uint8_t> bytes(stats.size() * sizeof(uint32_t));

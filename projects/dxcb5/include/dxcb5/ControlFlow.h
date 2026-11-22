@@ -21,6 +21,7 @@ struct FlowBlock {
   std::vector<FlowEdge> Edges;
   Operand Condition{OperandKind::Null};
   FlowKind Kind = FlowKind::Return;
+  bool UniformBranch = false;
 };
 
 // Block zero is the entry. Input blocks must satisfy their FlowKind edge shape,

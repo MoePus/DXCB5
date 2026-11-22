@@ -15,7 +15,6 @@ using namespace dxcb5::flow;
 
 namespace {
 
-#ifndef NDEBUG
 bool ValidShape(const FlowBlock &Block) {
   switch (Block.Kind) {
   case FlowKind::Return: return Block.Edges.empty();
@@ -57,7 +56,6 @@ bool ValidateBlock(const FlowBlock &Block, size_t BlockCount,
   }
   return true;
 }
-#endif
 
 std::vector<uint32_t> TopologicalOrder(const std::vector<FlowBlock> &Blocks) {
   std::vector<uint32_t> Incoming(Blocks.size());
@@ -328,11 +326,9 @@ bool dxcb5::LowerControlFlow(const std::vector<FlowBlock> &Blocks,
     Error = "invalid MIR block count";
     return false;
   }
-#ifndef NDEBUG
-  std::string ValidationError;
   for (const FlowBlock &Block : Blocks)
-    assert(ValidateBlock(Block, Blocks.size(), Program.TempCount, ValidationError));
-#endif
+    if (!ValidateBlock(Block, Blocks.size(), Program.TempCount, Error))
+      return false;
   Code Native{Program.TempCount, {}};
   if (EmitStructured(Blocks, Native))
     return Publish(Native, Program.TempCount, Program, Error);

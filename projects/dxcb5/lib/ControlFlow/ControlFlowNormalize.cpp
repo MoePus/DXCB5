@@ -43,40 +43,6 @@ LoopStep FindLoopEdges(const FlowBlock &Block, const DispatchOrder &Order,
   return Step;
 }
 
-std::array<bool, D3D10_SB_NUM_OPCODES> BuildPureArmTable() {
-  std::array<bool, D3D10_SB_NUM_OPCODES> Table{};
-  constexpr D3D10_SB_OPCODE_TYPE Allowed[] = {
-      D3D10_SB_OPCODE_ADD, D3D10_SB_OPCODE_AND, D3D10_SB_OPCODE_DIV,
-      D3D10_SB_OPCODE_DP2, D3D10_SB_OPCODE_DP3, D3D10_SB_OPCODE_DP4,
-      D3D10_SB_OPCODE_EQ, D3D10_SB_OPCODE_EXP, D3D10_SB_OPCODE_FRC,
-      D3D10_SB_OPCODE_FTOI, D3D10_SB_OPCODE_FTOU, D3D10_SB_OPCODE_GE,
-      D3D10_SB_OPCODE_IADD, D3D10_SB_OPCODE_IEQ, D3D10_SB_OPCODE_IGE,
-      D3D10_SB_OPCODE_ILT, D3D10_SB_OPCODE_IMAD, D3D10_SB_OPCODE_IMAX,
-      D3D10_SB_OPCODE_IMIN, D3D10_SB_OPCODE_IMUL, D3D10_SB_OPCODE_INE,
-      D3D10_SB_OPCODE_INEG, D3D10_SB_OPCODE_ISHL, D3D10_SB_OPCODE_ISHR,
-      D3D10_SB_OPCODE_ITOF, D3D10_SB_OPCODE_LD, D3D10_SB_OPCODE_LOG,
-      D3D10_SB_OPCODE_LT, D3D10_SB_OPCODE_MAD, D3D10_SB_OPCODE_MAX,
-      D3D10_SB_OPCODE_MIN, D3D10_SB_OPCODE_MOV, D3D10_SB_OPCODE_MOVC,
-      D3D10_SB_OPCODE_MUL, D3D10_SB_OPCODE_NE, D3D10_SB_OPCODE_NOT,
-      D3D10_SB_OPCODE_OR, D3D10_SB_OPCODE_RESINFO, D3D10_SB_OPCODE_ROUND_NE,
-      D3D10_SB_OPCODE_ROUND_NI, D3D10_SB_OPCODE_ROUND_PI,
-      D3D10_SB_OPCODE_ROUND_Z, D3D10_SB_OPCODE_RSQ,
-      D3D10_SB_OPCODE_SAMPLE_C_LZ, D3D10_SB_OPCODE_SAMPLE_D,
-      D3D10_SB_OPCODE_SAMPLE_L, D3D10_SB_OPCODE_SINCOS, D3D10_SB_OPCODE_SQRT,
-      D3D10_SB_OPCODE_UDIV, D3D10_SB_OPCODE_UGE, D3D10_SB_OPCODE_ULT,
-      D3D10_SB_OPCODE_UMAD, D3D10_SB_OPCODE_UMAX, D3D10_SB_OPCODE_UMIN,
-      D3D10_SB_OPCODE_USHR, D3D10_SB_OPCODE_UTOF, D3D10_SB_OPCODE_XOR,
-      D3D10_1_SB_OPCODE_GATHER4, D3D11_SB_OPCODE_BFI, D3D11_SB_OPCODE_BFREV,
-      D3D11_SB_OPCODE_COUNTBITS, D3D11_SB_OPCODE_F16TOF32,
-      D3D11_SB_OPCODE_F32TOF16, D3D11_SB_OPCODE_FIRSTBIT_HI,
-      D3D11_SB_OPCODE_FIRSTBIT_LO, D3D11_SB_OPCODE_FIRSTBIT_SHI,
-      D3D11_SB_OPCODE_IBFE, D3D11_SB_OPCODE_RCP, D3D11_SB_OPCODE_UBFE,
-  };
-  for (auto Opcode : Allowed)
-    Table[Opcode] = true;
-  return Table;
-}
-
 struct MultiExitLoop {
   uint32_t Begin;
   uint32_t End;
@@ -239,11 +205,41 @@ DispatchOrder::ExternalEntries(const std::vector<FlowBlock> &Flow) const {
 bool dxcb5::flow::HasQuadOperations(const std::vector<FlowBlock> &Flow,
                                     const DispatchOrder &Order,
                                     const Region &R) {
-  for (uint32_t I = R.Begin; I < R.End; ++I)
-    for (const Instruction &Inst : Flow[Order.Blocks[I]].Instructions)
+  bool FoundQuad = false;
+  bool HasUniformBranch = false;
+  bool AllBranchesUniform = true;
+  for (uint32_t I = R.Begin; I < R.End; ++I) {
+    const FlowBlock &FB = Flow[Order.Blocks[I]];
+    if (FB.Kind == FlowKind::Branch || FB.Kind == FlowKind::Switch) {
+      if (FB.UniformBranch)
+        HasUniformBranch = true;
+      else
+        AllBranchesUniform = false;
+    }
+    for (const Instruction &Inst : FB.Instructions)
       if (RequiresQuad(static_cast<D3D10_SB_OPCODE_TYPE>(Inst.Opcode)))
+        FoundQuad = true;
+  }
+  if (!FoundQuad)
+    return false;
+  if (!AllBranchesUniform)
+    return true;
+  for (uint32_t B = 0; B < Flow.size(); ++B) {
+    const uint32_t L = Order.Labels[B];
+    if (L >= R.Begin && L < R.End)
+      continue;
+    for (const FlowEdge &Edge : Flow[B].Edges) {
+      const uint32_t T = Order.Labels[Edge.Target];
+      if (T < R.Begin || T >= R.End)
+        continue;
+      if (Flow[B].Kind != FlowKind::Branch && Flow[B].Kind != FlowKind::Switch)
+        continue;
+      if (!Flow[B].UniformBranch)
         return true;
-  return false;
+      HasUniformBranch = true;
+    }
+  }
+  return !HasUniformBranch;
 }
 
 std::vector<LoopStep>
@@ -275,9 +271,7 @@ dxcb5::flow::GetLinearLoop(const std::vector<FlowBlock> &Flow,
 }
 
 bool dxcb5::flow::IsPureArmInstruction(const Instruction &Inst) {
-  static const auto PureOpcodes = BuildPureArmTable();
-  if (Inst.Opcode >= PureOpcodes.size() || !PureOpcodes[Inst.Opcode] ||
-      RequiresQuad(static_cast<D3D10_SB_OPCODE_TYPE>(Inst.Opcode)))
+  if (!InstructionCanMoveAcrossDivergentBranch(Inst.Opcode))
     return false;
   const unsigned Destinations = InstructionDestinationCount(Inst.Opcode);
   if (Destinations == 0 || Destinations > Inst.Operands.size())

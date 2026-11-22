@@ -504,4 +504,5 @@ void dxcb5::flow::OptimizeStructuredFlow(std::vector<Instruction> &Insts) {
   HoistLoopExitFlags(Insts);
   OptimizeStructuredCode(Insts);
   MergeConsecutiveMovs(Insts);
+  RunPostRaCleanup(Insts);
 }

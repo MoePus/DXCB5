@@ -15,8 +15,11 @@ constexpr uint32_t NoBlock = std::numeric_limits<uint32_t>::max();
 constexpr unsigned MaxBlocks = 256;
 constexpr size_t MaxBodyInstructions = 4096;
 constexpr size_t MaxEdgeCopies = 2048;
-// Copy cycles and shared-tail predicates use scratch.x. The inner-loop
-// exit selector lives in scratch.y until the synthetic branch reads it.
+// Shared-tail predicates use scratch.x. ParallelCopy may use all four lanes of
+// scratch during Out.Copies() to coalesce cross-register vector swaps.
+// The inner-loop exit selector lives in scratch.y strictly after Out.Copies()
+// on the exiting branch until the synthetic merge branch reads it (no edge
+// copies run in between).
 constexpr uint8_t ExitSelectorMask = 1u << 1;
 constexpr uint8_t ExitSelectorSwizzle = 0x55;
 constexpr uint32_t SelectFirstExit = 2;

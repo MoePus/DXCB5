@@ -181,6 +181,30 @@ bool IsSelfMov(const Instruction &Inst) {
   return true;
 }
 
+void RemapResourceReturnSwizzle(Operand &Res, uint8_t OldMask,
+                                const LaneAllocation &DestAlloc) {
+  uint8_t NewSwz = 0;
+  uint8_t WrittenSlots = 0;
+  unsigned FirstChan = 0;
+  bool HaveFirst = false;
+  for (unsigned VL = 0; VL < kRegisterLanes; ++VL) {
+    if (!(OldMask & (1u << VL)))
+      continue;
+    const unsigned PL = DestAlloc.LaneMap[VL];
+    const unsigned Chan = GetLane(Res.Swizzle, VL);
+    NewSwz = SetLane(NewSwz, PL, Chan);
+    WrittenSlots |= static_cast<uint8_t>(1u << PL);
+    if (!HaveFirst) {
+      FirstChan = Chan;
+      HaveFirst = true;
+    }
+  }
+  for (unsigned PL = 0; PL < kRegisterLanes; ++PL)
+    if (!(WrittenSlots & (1u << PL)))
+      NewSwz = SetLane(NewSwz, PL, FirstChan);
+  Res.Swizzle = NewSwz;
+}
+
 uint8_t MapDestMask(uint8_t OldMask, const LaneAllocation &DestAlloc) {
   uint8_t NewMask = 0;
   for (unsigned VL = 0; VL < kRegisterLanes; ++VL)
@@ -216,6 +240,16 @@ void RemapInstruction(Instruction &Inst,
     Dst.Index = DestAlloc.PhysReg;
     Dst.Mask = MapDestMask(OldMask, DestAlloc);
     return;
+  }
+
+  if (InstructionHasResourceReturnSwizzle(Inst.Opcode) && TempDestCount == 1) {
+    const Operand &DstRef = Inst.Operands[SingleTempDest];
+    const LaneAllocation &DestAlloc = Alloc[DstRef.Index];
+    const uint8_t OldMask = static_cast<uint8_t>(DstRef.Mask & 0xfu);
+    for (size_t I = Dests; I < Inst.Operands.size(); ++I)
+      if (Inst.Operands[I].Kind == OperandKind::Resource ||
+          Inst.Operands[I].Kind == OperandKind::Uav)
+        RemapResourceReturnSwizzle(Inst.Operands[I], OldMask, DestAlloc);
   }
 
   for (size_t I = Dests; I < Inst.Operands.size(); ++I) {
@@ -285,6 +319,8 @@ bool dxcb5::AllocateRegisters(std::vector<FlowBlock> &Blocks,
     Error = "MIR register allocation exceeded SM5 temporary register limit";
     return false;
   }
+  if (!VerifyAllocation(Blocks, Live, Allocation, PhysTempCount, Error))
+    return false;
   Program.TempCount = PhysTempCount;
   LiteralVectorInterner Interner(Program);
   for (FlowBlock &Block : Blocks)

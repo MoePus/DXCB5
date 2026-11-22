@@ -27,8 +27,7 @@ constexpr auto RegisterMaskShift = 4;
 D3D10_SB_OPERAND_TYPE RegisterType(OperandKind kind) {
   switch (kind) {
   case OperandKind::Temp: return D3D10_SB_OPERAND_TYPE_TEMP;
-  case OperandKind::Input:
-  case OperandKind::FrontFace: return D3D10_SB_OPERAND_TYPE_INPUT;
+  case OperandKind::Input: return D3D10_SB_OPERAND_TYPE_INPUT;
   case OperandKind::Output: return D3D10_SB_OPERAND_TYPE_OUTPUT;
   case OperandKind::Resource: return D3D10_SB_OPERAND_TYPE_RESOURCE;
   case OperandKind::Sampler: return D3D10_SB_OPERAND_TYPE_SAMPLER;
@@ -76,10 +75,13 @@ COperandBase EncodeSource(const MirProgram &program, const Operand &source,
   if (source.Kind == OperandKind::ImmediateVector) {
     assert(source.Index < program.LiteralVectors.size());
     const auto &bits = program.LiteralVectors[source.Index];
+    if (scalar)
+      return COperand(ApplyLiteralModifier(bits[source.Swizzle & 3u],
+                                           source.Modifier, intNeg));
     COperand operand(0, 0, 0, 0);
     for (unsigned lane = 0; lane < 4; ++lane)
-      operand.m_Value[lane] =
-          ApplyLiteralModifier(bits[lane], source.Modifier, intNeg);
+      operand.m_Value[lane] = ApplyLiteralModifier(
+          bits[(source.Swizzle >> (lane * 2)) & 3u], source.Modifier, intNeg);
     return operand;
   }
   const auto type = RegisterType(source.Kind);
@@ -501,16 +503,125 @@ bool WriteContainer(const MirProgram &program, CShaderAsm &assembler,
   return true;
 }
 
+bool ValidateResource(const BoundResource &r, std::string &error) {
+  if (r.Count != 1)
+    return error = "SM5 resource array count must be 1", false;
+  if (r.Type == D3D_SIT_SAMPLER)
+    return r.Slot < D3D11_COMMONSHADER_SAMPLER_SLOT_COUNT
+               ? true
+               : (error = "SM5 sampler slot exceeds limit", false);
+  if (r.Type == D3D_SIT_STRUCTURED)
+    return (r.Slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT && r.Stride > 0)
+               ? true
+               : (error = "invalid SM5 structured SRV slot or stride", false);
+  if (r.Type == D3D_SIT_BYTEADDRESS)
+    return r.Slot < D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT
+               ? true
+               : (error = "SM5 raw SRV slot exceeds limit", false);
+  if (r.Type == D3D_SIT_UAV_RWSTRUCTURED ||
+      r.Type == D3D_SIT_UAV_RWSTRUCTURED_WITH_COUNTER)
+    return (r.Slot < D3D11_1_UAV_SLOT_COUNT && r.Stride > 0)
+               ? true
+               : (error = "invalid SM5 structured UAV slot or stride", false);
+  if (r.Type == D3D_SIT_UAV_RWBYTEADDRESS)
+    return r.Slot < D3D11_1_UAV_SLOT_COUNT
+               ? true
+               : (error = "SM5 raw UAV slot exceeds limit", false);
+  const auto dim = ResourceDimension(r.Dimension);
+  const bool okRet = r.ReturnType >= D3D10_SB_RETURN_TYPE_UNORM &&
+                     r.ReturnType <= D3D10_SB_RETURN_TYPE_FLOAT;
+  if (r.Type == D3D_SIT_UAV_RWTYPED)
+    return (dim != D3D10_SB_RESOURCE_DIMENSION_UNKNOWN &&
+            r.Slot < D3D11_1_UAV_SLOT_COUNT && okRet)
+               ? true
+               : (error = "invalid SM5 typed UAV declaration", false);
+  if (r.Type != D3D_SIT_TEXTURE || dim == D3D10_SB_RESOURCE_DIMENSION_UNKNOWN ||
+      r.Slot >= D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT || !okRet)
+    return error = "invalid SM5 texture SRV declaration", false;
+  return true;
+}
+
+bool ValidateMirProgram(const MirProgram &program, std::string &error) {
+  if (program.TempCount > D3D11_COMMONSHADER_TEMP_REGISTER_COUNT)
+    return error = "SM5 temp register count exceeds 4096", false;
+  uint64_t totalIdx = 0;
+  for (const auto &it : program.IndexableTemps)
+    totalIdx += it.Elements;
+  if (totalIdx > D3D11_COMMONSHADER_TEMP_REGISTER_COUNT)
+    return error = "SM5 total indexable temp elements exceed 4096", false;
+  if (program.ImmediateConstants.size() % 4 != 0)
+    return error = "SM5 immediate constant buffer is not 4-word aligned", false;
+  for (const auto &cb : program.ConstantBuffers)
+    if (cb.Slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT ||
+        !cb.Size || cb.Size > D3D11_REQ_CONSTANT_BUFFER_ELEMENT_COUNT * 16)
+      return error = "SM5 constant buffer slot or size exceeds limit", false;
+  for (const auto &r : program.Resources)
+    if (!ValidateResource(r, error))
+      return false;
+  struct CfFrame {
+    uint32_t OpenOp;
+    bool SeenElse;
+  };
+  std::vector<CfFrame> CfStack;
+  for (const auto &inst : program.Instructions) {
+    if (inst.Opcode >= D3D10_SB_NUM_OPCODES ||
+        inst.Operands.size() !=
+            GetNumInstructionOperands(static_cast<D3D10_SB_OPCODE_TYPE>(inst.Opcode)))
+      return error = "invalid SM5 MIR instruction opcode or operand count", false;
+    switch (inst.Opcode) {
+    case D3D10_SB_OPCODE_IF:
+    case D3D10_SB_OPCODE_LOOP:
+    case D3D10_SB_OPCODE_SWITCH:
+      CfStack.push_back({inst.Opcode, false});
+      break;
+    case D3D10_SB_OPCODE_ELSE:
+      if (CfStack.empty() || CfStack.back().OpenOp != D3D10_SB_OPCODE_IF ||
+          CfStack.back().SeenElse)
+        return error = "unbalanced SM5 ELSE instruction", false;
+      CfStack.back().SeenElse = true;
+      break;
+    case D3D10_SB_OPCODE_ENDIF:
+      if (CfStack.empty() || CfStack.back().OpenOp != D3D10_SB_OPCODE_IF)
+        return error = "unbalanced SM5 ENDIF instruction", false;
+      CfStack.pop_back();
+      break;
+    case D3D10_SB_OPCODE_ENDLOOP:
+      if (CfStack.empty() || CfStack.back().OpenOp != D3D10_SB_OPCODE_LOOP)
+        return error = "unbalanced SM5 ENDLOOP instruction", false;
+      CfStack.pop_back();
+      break;
+    case D3D10_SB_OPCODE_ENDSWITCH:
+      if (CfStack.empty() || CfStack.back().OpenOp != D3D10_SB_OPCODE_SWITCH)
+        return error = "unbalanced SM5 ENDSWITCH instruction", false;
+      CfStack.pop_back();
+      break;
+    default:
+      break;
+    }
+    for (const auto &op : inst.Operands) {
+      if (op.Kind == OperandKind::ImmediateVector &&
+          op.Index >= program.LiteralVectors.size())
+        return error = "SM5 literal vector index out of bounds", false;
+      if (op.Kind == OperandKind::IndexableTemp &&
+          (op.Index >= program.IndexableTemps.size() ||
+           (op.RelativeRegister == UINT32_MAX &&
+            op.Element >= program.IndexableTemps[op.Index].Elements)))
+        return error = "SM5 indexable temp index or element out of bounds", false;
+    }
+  }
+  if (!CfStack.empty())
+    return error = "unterminated SM5 structured control-flow block", false;
+  return true;
+}
+
 } // namespace
 
 bool WriteDxbc(const MirProgram &program, std::vector<uint8_t> &output,
                std::string &error) {
-  static const bool initialized = [] {
-    InitInstructionInfo();
-    return true;
-  }();
+  static const bool initialized = (InitInstructionInfo(), true);
   (void)initialized;
-  assert(program.TempCount <= D3D11_COMMONSHADER_TEMP_REGISTER_COUNT);
+  if (!ValidateMirProgram(program, error))
+    return false;
   CShaderAsm assembler;
   assembler.StartShader(program.ShaderStage == Stage::Vertex
                             ? D3D10_SB_VERTEX_SHADER : D3D10_SB_PIXEL_SHADER,

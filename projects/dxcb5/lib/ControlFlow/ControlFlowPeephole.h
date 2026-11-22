@@ -68,6 +68,7 @@ bool TryDropRedundantTrailingMov(std::vector<Instruction> &Insts, size_t I,
 void OptimizeStructuredCode(std::vector<Instruction> &Insts);
 void HoistLoopExitFlags(std::vector<Instruction> &Insts);
 void MergeConsecutiveMovs(std::vector<Instruction> &Insts);
+void RunPostRaCleanup(std::vector<Instruction> &Insts);
 
 } // namespace dxcb5::flow
 

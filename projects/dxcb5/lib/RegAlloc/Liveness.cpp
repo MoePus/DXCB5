@@ -110,7 +110,8 @@ bool ScanInstruction(const Instruction &Inst, BlockScanContext &Ctx,
     TempDestCount += (Inst.Operands[I].Kind == OperandKind::Temp) ? 1u : 0u;
 
   const bool MustFixDest =
-      (!InstructionIsLaneRemappable(Inst.Opcode) && !IsDotOpcode(Inst.Opcode)) ||
+      (!InstructionIsLaneRemappable(Inst.Opcode) && !IsDotOpcode(Inst.Opcode) &&
+       !InstructionSupportsNarrowDestMask(Inst.Opcode)) ||
       TempDestCount > 1;
   for (size_t I = 0; I < Dests; ++I) {
     const Operand &Op = Inst.Operands[I];
@@ -339,4 +340,100 @@ bool dxcb5::ComputeLiveness(llvm::ArrayRef<FlowBlock> Blocks,
     }
   }
   return true;
+}
+
+uint32_t dxcb5::ComputeExactPeakLanes(llvm::ArrayRef<FlowBlock> Blocks,
+                                      uint32_t TempCount,
+                                      const LivenessResult *CachedLive,
+                                      std::vector<uint32_t> *OutBlockPeaks) {
+  if (OutBlockPeaks)
+    OutBlockPeaks->assign(Blocks.size(), 0);
+  if (TempCount == 0 || Blocks.empty())
+    return 0;
+  LivenessResult LocalLive;
+  if (!CachedLive) {
+    if (!ComputeLiveness(Blocks, TempCount, LocalLive))
+      return 0;
+    CachedLive = &LocalLive;
+  }
+
+  std::vector<uint8_t> LiveMask(TempCount, 0);
+  std::vector<uint32_t> Touched;
+  Touched.reserve(64);
+  uint32_t CurLanes = 0;
+  uint32_t GlobalPeak = 0;
+  uint32_t BlockPeak = 0;
+
+  auto UpdateMask = [&](uint32_t Reg, uint8_t NewMask) {
+    if (Reg >= TempCount)
+      return;
+    NewMask &= 0xfu;
+    const uint8_t Old = LiveMask[Reg];
+    if (Old == NewMask)
+      return;
+    if (Old == 0)
+      Touched.push_back(Reg);
+    LiveMask[Reg] = NewMask;
+    CurLanes = CurLanes + Popcount4(NewMask) - Popcount4(Old);
+    if (CurLanes > BlockPeak)
+      BlockPeak = CurLanes;
+  };
+  auto AddMask = [&](uint32_t Reg, uint8_t Mask) {
+    if (Reg < TempCount)
+      UpdateMask(Reg, static_cast<uint8_t>(LiveMask[Reg] | (Mask & 0xfu)));
+  };
+  auto ClearMask = [&](uint32_t Reg, uint8_t Mask) {
+    if (Reg < TempCount)
+      UpdateMask(Reg, static_cast<uint8_t>(LiveMask[Reg] & ~(Mask & 0xfu)));
+  };
+
+  for (size_t B = 0; B < Blocks.size(); ++B) {
+    for (uint32_t Reg : Touched)
+      LiveMask[Reg] = 0;
+    Touched.clear();
+    CurLanes = 0;
+    BlockPeak = 0;
+
+    CachedLive->ForEachLive(CachedLive->Blocks[B].Out,
+                            [&](uint32_t Reg, uint8_t Mask) { AddMask(Reg, Mask); });
+    const auto &Blk = Blocks[B];
+    if (HasCondition(Blk)) {
+      if (Blk.Condition.Kind == OperandKind::Temp)
+        AddMask(Blk.Condition.Index,
+                static_cast<uint8_t>(1u << (Blk.Condition.Swizzle & 3u)));
+      if (Blk.Condition.RelativeRegister != UINT32_MAX)
+        AddMask(Blk.Condition.RelativeRegister,
+                static_cast<uint8_t>(1u << Blk.Condition.RelativeLane));
+    }
+    for (size_t Rev = Blk.Instructions.size(); Rev > 0; --Rev) {
+      const auto &Inst = Blk.Instructions[Rev - 1];
+      const size_t Dests = std::min<size_t>(
+          InstructionDestinationCount(Inst.Opcode), Inst.Operands.size());
+      const uint8_t DestMask = CombinedInstructionDestMask(Inst);
+      for (size_t I = 0; I < Dests; ++I) {
+        const auto &Op = Inst.Operands[I];
+        if (Op.Kind == OperandKind::Temp)
+          AddMask(Op.Index, Op.Mask);
+      }
+      for (size_t I = 0; I < Dests; ++I) {
+        const auto &Op = Inst.Operands[I];
+        if (Op.Kind == OperandKind::Temp)
+          ClearMask(Op.Index, Op.Mask);
+      }
+      for (size_t I = 0; I < Inst.Operands.size(); ++I) {
+        const auto &Op = Inst.Operands[I];
+        if (Op.RelativeRegister != UINT32_MAX)
+          AddMask(Op.RelativeRegister,
+                  static_cast<uint8_t>(1u << Op.RelativeLane));
+        if (I >= Dests && Op.Kind == OperandKind::Temp)
+          AddMask(Op.Index, InstructionSourceReadLanes(Inst.Opcode, DestMask,
+                                                       I - Dests, Op.Swizzle));
+      }
+    }
+    if (OutBlockPeaks)
+      (*OutBlockPeaks)[B] = BlockPeak;
+    if (BlockPeak > GlobalPeak)
+      GlobalPeak = BlockPeak;
+  }
+  return GlobalPeak;
 }

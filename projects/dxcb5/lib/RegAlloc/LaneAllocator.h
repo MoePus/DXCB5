@@ -7,6 +7,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include <array>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace dxcb5 {
@@ -23,6 +24,14 @@ bool AllocateLaneRegisters(llvm::ArrayRef<FlowBlock> Blocks,
                            const LivenessResult &Live,
                            std::vector<LaneAllocation> &Allocation,
                            uint32_t &PhysTempCount);
+
+// Post-RA validator matching `lean/RegAllocValidator.lean`: checks bounds,
+// lane-map injectivity, fixed-lane preservation, PhysMask exactness, and zero
+// physical-slot interference across all live ranges and edge copies.
+bool VerifyAllocation(llvm::ArrayRef<FlowBlock> Blocks,
+                      const LivenessResult &Live,
+                      llvm::ArrayRef<LaneAllocation> Allocation,
+                      uint32_t PhysTempCount, std::string &Error);
 
 } // namespace dxcb5
 #endif

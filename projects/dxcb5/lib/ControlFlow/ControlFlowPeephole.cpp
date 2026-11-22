@@ -84,6 +84,13 @@ bool RangeClearForMovFold(const std::vector<Instruction> &Insts,
       if (OldSrc.Kind == OperandKind::Temp && MD.Kind == OperandKind::Temp &&
           MD.Index == OldSrc.Index && (MD.Mask & OldRead))
         return false;
+      if (OldSrc.Kind == OperandKind::IndexableTemp &&
+          MD.Kind == OperandKind::IndexableTemp && MD.Index == OldSrc.Index)
+        return false;
+      if (OldSrc.RelativeRegister != UINT32_MAX &&
+          MD.Kind == OperandKind::Temp && MD.Index == OldSrc.RelativeRegister &&
+          (MD.Mask & (1u << OldSrc.RelativeLane)))
+        return false;
     }
     for (size_t O = ND; O < Mid.Operands.size(); ++O) {
       const auto &MS = Mid.Operands[O];
@@ -506,25 +513,48 @@ void dxcb5::flow::OptimizeStructuredCode(std::vector<Instruction> &Insts) {
     bool Changed = CompactTrivialIfs(Insts);
     BuildIfSpanTable(Insts, Spans);
     bool LoopChanged = false;
+    size_t CleanCurStart = 0;
+    ptrdiff_t Shift = 0;
     size_t I = 0;
     while (I < Insts.size()) {
       if (Insts[I].Opcode != D3D10_SB_OPCODE_IF) {
         ++I;
         continue;
       }
-      const IfSpan Span = LoopChanged ? ScanIfSpan(Insts, I) : Spans[I];
+      IfSpan Span;
+      if (I >= CleanCurStart) {
+        const size_t OrigI =
+            static_cast<size_t>(static_cast<ptrdiff_t>(I) - Shift);
+        Span = Spans[OrigI];
+        if (Span.ElsePos != kNoPos)
+          Span.ElsePos =
+              static_cast<size_t>(static_cast<ptrdiff_t>(Span.ElsePos) + Shift);
+        if (Span.EndPos != kNoPos)
+          Span.EndPos =
+              static_cast<size_t>(static_cast<ptrdiff_t>(Span.EndPos) + Shift);
+      } else {
+        Span = ScanIfSpan(Insts, I);
+      }
       if (Span.EndPos == kNoPos) {
         ++I;
         continue;
       }
+      const size_t OldSize = Insts.size();
+      const size_t CurEnd = Span.EndPos;
       const bool Hit = Span.ElsePos == kNoPos
-                           ? SimplifyIfNoElse(Insts, I, Span.EndPos)
-                           : SimplifyIfWithElse(Insts, I, Span.ElsePos,
-                                                Span.EndPos);
-      if (Hit)
+                           ? SimplifyIfNoElse(Insts, I, CurEnd)
+                           : SimplifyIfWithElse(Insts, I, Span.ElsePos, CurEnd);
+      if (Hit) {
+        const ptrdiff_t Delta = static_cast<ptrdiff_t>(Insts.size()) -
+                                static_cast<ptrdiff_t>(OldSize);
+        Shift += Delta;
+        const size_t RawClean = std::max(CleanCurStart, CurEnd + 1);
+        CleanCurStart =
+            static_cast<size_t>(static_cast<ptrdiff_t>(RawClean) + Delta);
         LoopChanged = true;
-      else
+      } else {
         ++I;
+      }
     }
     if (!Changed && !LoopChanged)
       break;

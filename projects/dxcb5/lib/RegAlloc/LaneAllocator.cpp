@@ -483,16 +483,24 @@ bool dxcb5::AllocateLaneRegisters(llvm::ArrayRef<FlowBlock> Blocks,
   std::vector<uint32_t> Roots;
   Roots.reserve(Live.ActiveTemps.size());
   std::vector<unsigned> RootDegree(Count, 0);
+  unsigned MaxRootDegree = 0;
   for (uint32_t R : Live.ActiveTemps) {
     if (State.Rep[R] != R || PreColored[R])
       continue;
     Roots.push_back(R);
     for (unsigned L = 0; L < kRegisterLanes; ++L)
       RootDegree[R] += Graph.GetDegree(SlotOf[R][L]);
+    MaxRootDegree = std::max(MaxRootDegree, RootDegree[R]);
   }
+  const bool HighPressure = MaxRootDegree >= 200;
   std::stable_sort(Roots.begin(), Roots.end(), [&](uint32_t A, uint32_t B) {
     if (Live.Temps[A].Width != Live.Temps[B].Width)
       return Live.Temps[A].Width > Live.Temps[B].Width;
+    if (HighPressure) {
+      if (RootDegree[A] != RootDegree[B])
+        return RootDegree[A] > RootDegree[B];
+      return TotalWeight[A] > TotalWeight[B];
+    }
     if (TotalWeight[A] != TotalWeight[B])
       return TotalWeight[A] > TotalWeight[B];
     return RootDegree[A] > RootDegree[B];
