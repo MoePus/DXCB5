@@ -378,4 +378,54 @@ theorem mixedSchedule_preserves_untouched
 
 end ReadOnly
 
+-- Multi-lane scratch schedule: mirrors ParallelCopy.cpp breaking cross-register
+-- vector cycles across any lane of a dedicated 4-lane scratch register.
+inductive ScheduleSet (isScratch : Register → Prop) : List Copy → List Copy → Prop
+  | done : ScheduleSet isScratch [] []
+  | ready (before after : List Copy) (chosen : Copy) (rest : List Copy)
+      (unique : ¬ Writes (before ++ after) chosen.destination)
+      (ready : ¬ HasRead (before ++ after) chosen.destination)
+      (next : ScheduleSet isScratch (before ++ after) rest) :
+      ScheduleSet isScratch (before ++ chosen :: after) (chosen :: rest)
+  | spill (copies : List Copy) (saved scratch : Register) (rest : List Copy)
+      (inScratch : isScratch scratch)
+      (distinct : saved ≠ scratch) (fresh : ¬ HasRead copies scratch)
+      (next : ScheduleSet isScratch (copies.map (redirect saved scratch)) rest) :
+      ScheduleSet isScratch copies (⟨scratch, saved⟩ :: rest)
+
+theorem scheduleSet_preserves (isScratch : Register → Prop)
+    (copies sequence : List Copy)
+    (schedule : ScheduleSet isScratch copies sequence) (initial : State α)
+    (r : Register) (live : ¬ isScratch r) :
+    execute sequence initial r = initial (parallelOrigin copies r) := by
+  induction schedule generalizing initial with
+  | done => rfl
+  | ready before after chosen rest unique ready next ih =>
+    change execute rest (step chosen initial) r =
+      initial (parallelOrigin (before ++ chosen :: after) r)
+    rw [ih]
+    exact emit_ready_preserves before after chosen unique ready initial r
+  | spill copies saved scratch rest inScratch distinct fresh next ih =>
+    have notScratch : r ≠ scratch := fun h => live (h ▸ inScratch)
+    change execute rest (step ⟨scratch, saved⟩ initial) r =
+      initial (parallelOrigin copies r)
+    rw [ih]
+    exact spill_preserves copies saved scratch fresh initial r notScratch
+
+def isScratchLane (scratchReg : Nat) (k : Register) : Prop :=
+  ∃ lane : Fin 4, k = componentKey scratchReg lane
+
+theorem fourLaneScratch_preserves (scratchReg : Nat)
+    (copies sequence : List Copy) (unique : UniqueDestinations copies)
+    (schedule : ScheduleSet (isScratchLane scratchReg) (Pending copies) sequence)
+    (initial : State α) (reg : Nat) (lane : Fin 4) (live : reg ≠ scratchReg) :
+    execute sequence initial (componentKey reg lane) =
+      initial (parallelOrigin copies (componentKey reg lane)) := by
+  have notScratch : ¬ isScratchLane scratchReg (componentKey reg lane) := by
+    intro ⟨sLane, eq⟩
+    exact live (componentKey_injective eq).1
+  rw [scheduleSet_preserves (isScratchLane scratchReg) (Pending copies) sequence
+    schedule initial (componentKey reg lane) notScratch,
+    pendingOrigin_preserves copies unique (componentKey reg lane)]
+
 end DXCB5.ParallelCopy

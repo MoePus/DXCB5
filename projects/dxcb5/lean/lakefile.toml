@@ -1,5 +1,24 @@
 name = "Dxcb5Proofs"
-defaultTargets = ["ParallelCopy"]
+defaultTargets = ["ParallelCopy", "OpcodeSpec", "LaneDomain", "RewriteRules", "RegAllocValidator", "Placement", "dxcb5-codegen"]
 
 [[lean_lib]]
 name = "ParallelCopy"
+
+[[lean_lib]]
+name = "OpcodeSpec"
+
+[[lean_lib]]
+name = "LaneDomain"
+
+[[lean_lib]]
+name = "RewriteRules"
+
+[[lean_lib]]
+name = "RegAllocValidator"
+
+[[lean_lib]]
+name = "Placement"
+
+[[lean_exe]]
+name = "dxcb5-codegen"
+root = "Codegen"
