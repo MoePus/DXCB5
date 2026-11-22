@@ -7,6 +7,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "dxc/HLSL/Dxcb5Contract.h" // HLSL Change
 #include "clang/CodeGen/BackendUtil.h"
 #include "dxc/HLSL/DxilGenerationPass.h" // HLSL Change
 #include "dxc/HLSL/HLMatrixLowerPass.h"  // HLSL Change
@@ -760,7 +761,13 @@ void EmitAssemblyHelper::EmitAssembly(BackendAction Action,
 
   if (PerModulePasses) {
     PrettyStackTraceString CrashInfo("Per-module optimization passes");
+    llvm::NamedMDNode *Dxcb5Marker = nullptr;
+    if (CodeGenOpts.DXCB5PreserveVectors)
+      Dxcb5Marker =
+          TheModule->getOrInsertNamedMetadata(llvm::dxcb5_contract::kPipelineMD);
     PerModulePasses->run(*TheModule);
+    if (Dxcb5Marker)
+      TheModule->eraseNamedMetadata(Dxcb5Marker);
   }
 
   if (CodeGenPasses) {

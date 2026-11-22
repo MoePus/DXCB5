@@ -27,6 +27,7 @@
 #include "dxc/HLSL/HLMatrixLowerHelper.h"
 #include "dxc/HLSL/HLMatrixType.h"
 #include "dxc/HLSL/HLModule.h"
+#include "dxc/HLSL/Dxcb5Contract.h"
 #include "dxc/HLSL/HLOperationLower.h"
 #include "dxc/HLSL/HLOperationLowerExtension.h"
 #include "dxc/HLSL/HLOperations.h"
@@ -2917,7 +2918,12 @@ Value *TranslatePow(CallInst *CI, IntrinsicOp IOP, OP::OpCode opcode,
   bool isFXCCompatMode =
       CI->getModule()->GetHLModule().GetHLOptions().bFXCCompatMode;
   IRBuilder<> Builder(CI);
-  return TranslatePowImpl(hlslOP, Builder, x, y, isFXCCompatMode);
+  Value *Res = TranslatePowImpl(hlslOP, Builder, x, y, isFXCCompatMode);
+  if (MDNode *FM = CI->getMetadata(dxcb5_contract::kFastMathMD)) {
+    if (auto *ResI = dyn_cast_or_null<Instruction>(Res))
+      ResI->setMetadata(dxcb5_contract::kFastMathMD, FM);
+  }
+  return Res;
 }
 
 Value *TranslatePrintf(CallInst *CI, IntrinsicOp IOP, DXIL::OpCode opcode,

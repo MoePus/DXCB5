@@ -15305,6 +15305,83 @@ void hlsl::HandleDeclAttributeForHLSL(Sema &S, Decl *D, const AttributeList &A,
         unsigned(ValidateAttributeIntArg(S, A, 1)),
         A.getAttributeSpellingListIndex());
     break;
+  case AttributeList::AT_DXCB5Immutable:
+    declAttr = ::new (S.Context)
+        DXCB5ImmutableAttr(A.getRange(), S.Context,
+                           A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5SpecConst:
+    declAttr = ::new (S.Context)
+        DXCB5SpecConstAttr(A.getRange(), S.Context,
+                           A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5SpecZeroOne:
+    declAttr = ::new (S.Context)
+        DXCB5SpecZeroOneAttr(A.getRange(), S.Context,
+                             A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5SpecIdentity:
+    declAttr = ::new (S.Context)
+        DXCB5SpecIdentityAttr(A.getRange(), S.Context,
+                              A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5Dynamic:
+    declAttr = ::new (S.Context)
+        DXCB5DynamicAttr(A.getRange(), S.Context,
+                         A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5Uniform:
+    declAttr = ::new (S.Context)
+        DXCB5UniformAttr(A.getRange(), S.Context,
+                         A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5FastMath:
+    declAttr = ::new (S.Context)
+        DXCB5FastMathAttr(A.getRange(), S.Context,
+                          A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5SpecValues: {
+    llvm::SmallVector<unsigned, 4> bitValues;
+    for (unsigned i = 0; i < A.getNumArgs(); ++i) {
+      Expr *E = A.getArgAsExpr(i);
+      bool neg = false;
+      while (E) {
+        if (auto *PE = dyn_cast<ParenExpr>(E)) {
+          E = PE->getSubExpr();
+        } else if (auto *ICE = dyn_cast<ImplicitCastExpr>(E)) {
+          E = ICE->getSubExpr();
+        } else if (auto *UO = dyn_cast<UnaryOperator>(E)) {
+          if (UO->getOpcode() == UO_Minus)
+            neg = !neg;
+          else if (UO->getOpcode() != UO_Plus)
+            break;
+          E = UO->getSubExpr();
+        } else {
+          break;
+        }
+      }
+      float val = 0.0f;
+      if (auto *FL = dyn_cast_or_null<FloatingLiteral>(E)) {
+        llvm::APFloat flV = FL->getValue();
+        val = (flV.getSizeInBits(flV.getSemantics()) == 64)
+                  ? static_cast<float>(flV.convertToDouble())
+                  : flV.convertToFloat();
+      } else if (auto *IL = dyn_cast_or_null<IntegerLiteral>(E)) {
+        val = static_cast<float>(IL->getValue().getLimitedValue());
+      } else if (E) {
+        S.Diag(E->getLocStart(), diag::err_hlsl_attribute_expects_float_literal)
+            << A.getName();
+      }
+      if (neg)
+        val = -val;
+      unsigned bits = 0;
+      std::memcpy(&bits, &val, sizeof(bits));
+      bitValues.push_back(bits);
+    }
+    declAttr = ::new (S.Context) DXCB5SpecValuesAttr(
+        A.getRange(), S.Context, bitValues.data(), bitValues.size(),
+        A.getAttributeSpellingListIndex());
+  } break;
   default:
     Handled = false;
     return;
@@ -15394,6 +15471,20 @@ Attr *hlsl::ProcessStmtAttributeForHLSL(Sema &S, Stmt *St,
     ValidateAttributeOnSwitch(S, St, A);
     result = ::new (S.Context) HLSLCallAttr(A.getRange(), S.Context,
                                             A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5StrictBranch:
+    ValidateAttributeOnSwitchOrIf(S, St, A);
+    result = ::new (S.Context) DXCB5StrictBranchAttr(
+        A.getRange(), S.Context, A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5Uniform:
+    ValidateAttributeOnSwitchOrIf(S, St, A);
+    result = ::new (S.Context) DXCB5UniformAttr(
+        A.getRange(), S.Context, A.getAttributeSpellingListIndex());
+    break;
+  case AttributeList::AT_DXCB5FastMath:
+    result = ::new (S.Context) DXCB5FastMathAttr(
+        A.getRange(), S.Context, A.getAttributeSpellingListIndex());
     break;
   default:
     Handled = false;

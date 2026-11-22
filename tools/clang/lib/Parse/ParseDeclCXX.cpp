@@ -3750,6 +3750,8 @@ static bool IsBuiltInOrStandardCXX11Attribute(IdentifierInfo *AttrName,
 // HLSL Change Start
 static bool hasCXXAttributeInHLSL(IdentifierInfo *ScopeName,
                                   IdentifierInfo *AttrName) {
+  if (ScopeName && ScopeName->getName() == "dxcb5")
+    return true;
   if (ScopeName && ScopeName->getName() != "")
     return false;
 

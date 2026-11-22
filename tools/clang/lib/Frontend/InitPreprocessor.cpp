@@ -368,6 +368,7 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
 #if 1 // HLSL Change Starts
   if (LangOpts.HLSL) {
     Builder.defineMacro("__hlsl_dx_compiler");
+    Builder.defineMacro("__DXCB5__", "100");
     // DXC Version information
     Builder.defineMacro("__DXC_VERSION_MAJOR", STRINGIFY(RC_VERSION_FIELD_1));
     Builder.defineMacro("__DXC_VERSION_MINOR", STRINGIFY(RC_VERSION_FIELD_2));

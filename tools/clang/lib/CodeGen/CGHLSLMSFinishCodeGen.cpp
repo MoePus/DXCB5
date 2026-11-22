@@ -11,6 +11,7 @@
 
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Analysis/DxilValueCache.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
@@ -26,6 +27,7 @@
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
 
+#include "dxc/HLSL/Dxcb5Contract.h"
 #include "CodeGenFunction.h"
 #include "CodeGenModule.h"
 #include "clang/Basic/LangOptions.h"
@@ -1055,6 +1057,9 @@ void AddOpcodeParamForIntrinsic(HLModule &HLM, Function *F, unsigned opcode,
     }
 
     Value *CI = Builder.CreateCall(opFunc, opcodeParamList);
+    if (MDNode *FM = oldCI->getMetadata(llvm::dxcb5_contract::kFastMathMD))
+      if (auto *NewCI = dyn_cast<Instruction>(CI))
+        NewCI->setMetadata(llvm::dxcb5_contract::kFastMathMD, FM);
     if (group == HLOpcodeGroup::HLIntrinsic &&
         opcode == static_cast<unsigned>(IntrinsicOp::MOP_OutputComplete)) {
       DXASSERT_NOMSG(nodeRecordArg->getType()->isPointerTy());
@@ -2607,6 +2612,30 @@ bool CreateCBufferVariable(HLCBuffer &CB, HLModule &HLM, llvm::Type *HandleTy) {
     hlResTy = dxilutil::StripArrayTypes(hlResTy);
   }
 
+  // Collect DXCB5 spec-branch / uniform global names so the per-field GEP
+  // retains contract metadata after GV uses are rewritten to cbSubscript GEPs.
+  auto CollectTaggedGlobalNames = [&](const char *MDName) {
+    llvm::StringSet<> Names;
+    if (NamedMDNode *NMD = M.getNamedMetadata(MDName)) {
+      for (unsigned I = 0; I < NMD->getNumOperands(); ++I) {
+        MDNode *Node = NMD->getOperand(I);
+        if (Node && Node->getNumOperands() >= 1) {
+          if (auto *S = dyn_cast<MDString>(Node->getOperand(0)))
+            Names.insert(S->getString());
+        }
+      }
+    }
+    return Names;
+  };
+  const llvm::StringSet<> SpecBranchNames =
+      CollectTaggedGlobalNames(llvm::dxcb5_contract::kSpecBranchGlobalsMD);
+  const llvm::StringSet<> UniformGlobalNames =
+      CollectTaggedGlobalNames(llvm::dxcb5_contract::kUniformGlobalsMD);
+  MDNode *EmptyContractMD =
+      (SpecBranchNames.empty() && UniformGlobalNames.empty())
+          ? nullptr
+          : MDNode::get(Context, None);
+
   for (Function &F : M.functions()) {
     if (F.isDeclaration())
       continue;
@@ -2640,6 +2669,15 @@ bool CreateCBufferVariable(HLCBuffer &CB, HLModule &HLM, llvm::Type *HandleTy) {
             Builder.CreateInBoundsGEP(cbSubscript, {zero, idx});
         // TODO: make sure the debug info is synced to GEP.
         // GEP->setDebugLoc(GV);
+        if (EmptyContractMD && GV->hasName()) {
+          const llvm::StringRef GvName = GV->getName();
+          if (SpecBranchNames.count(GvName))
+            static_cast<Instruction *>(GEP)->setMetadata(
+                llvm::dxcb5_contract::kSpecBranchGlobalsMD, EmptyContractMD);
+          if (UniformGlobalNames.count(GvName))
+            static_cast<Instruction *>(GEP)->setMetadata(
+                llvm::dxcb5_contract::kUniformGlobalsMD, EmptyContractMD);
+        }
 
         HandleToResHelper H2ResHelper(Builder, hlResTy, Handle, F, HLM);
         ReplaceUseInFunction(GV, GEP, &F, Builder, &H2ResHelper);

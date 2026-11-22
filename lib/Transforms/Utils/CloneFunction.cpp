@@ -30,6 +30,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/TimeProfiler.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "dxc/HLSL/Dxcb5Contract.h" // HLSL Change
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
@@ -291,9 +292,12 @@ namespace {
       }
     }
 
-    // HLSL Change: identify non-escaped single-store integer allocas in entry.
+    // DXCB5 Change: identify non-escaped single-store integer allocas in entry
+    // (gated to DXCB5 pipeline, and restricted to stores in the entry block
+    // that precede any load in entry so the store strictly dominates all loads).
     void CollectSingleStoreAllocas() {
-      if (Director || OldFunc->empty())
+      if (Director || OldFunc->empty() || !OldFunc->getParent() ||
+          !OldFunc->getParent()->getNamedMetadata(dxcb5_contract::kPipelineMD))
         return;
       const BasicBlock &Entry = OldFunc->getEntryBlock();
       for (const Instruction &I : Entry) {
@@ -305,8 +309,9 @@ namespace {
         bool Valid = true;
         for (const User *U : AI->users()) {
           if (const StoreInst *SI = dyn_cast<StoreInst>(U)) {
-            if (SingleStore || SI->isVolatile() || SI->isAtomic() ||
-                SI->getPointerOperand() != AI || SI->getValueOperand() == AI ||
+            if (SingleStore || SI->getParent() != &Entry || SI->isVolatile() ||
+                SI->isAtomic() || SI->getPointerOperand() != AI ||
+                SI->getValueOperand() == AI ||
                 SI->getValueOperand()->getType() != AI->getAllocatedType()) {
               Valid = false;
               break;
@@ -336,8 +341,20 @@ namespace {
             break;
           }
         }
-        if (Valid && SingleStore)
-          SingleStoreToAlloca[SingleStore] = AI;
+        if (Valid && SingleStore) {
+          // Verify no load of AI precedes SingleStore in Entry.
+          for (const Instruction &EI : Entry) {
+            if (&EI == SingleStore)
+              break;
+            if (const LoadInst *LI = dyn_cast<LoadInst>(&EI))
+              if (LI->getPointerOperand() == AI) {
+                Valid = false;
+                break;
+              }
+          }
+          if (Valid)
+            SingleStoreToAlloca[SingleStore] = AI;
+        }
       }
     }
 

@@ -1509,6 +1509,59 @@ def VKStorageClassExt : InheritableAttr {
   let Documentation = [Undocumented];
 }
 
+// DXCB5 specialization and annotation attributes.
+def DXCB5Immutable : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "immutable">];
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def DXCB5SpecConst : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "spec_const">];
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def DXCB5SpecValues : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "spec_values">];
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Args = [VariadicUnsignedArgument<"BitValues">];
+  let Documentation = [Undocumented];
+}
+
+def DXCB5SpecZeroOne : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "spec_zero_one">];
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def DXCB5SpecIdentity : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "spec_identity">];
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def DXCB5Dynamic : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "dynamic">];
+  let Subjects = SubjectList<[Var], ErrorDiag>;
+  let Documentation = [Undocumented];
+}
+
+def DXCB5StrictBranch : Attr {
+  let Spellings = [CXX11<"dxcb5", "strict_branch">];
+  let Documentation = [Undocumented];
+}
+
+def DXCB5Uniform : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "uniform">];
+  let Documentation = [Undocumented];
+}
+
+def DXCB5FastMath : InheritableAttr {
+  let Spellings = [CXX11<"dxcb5", "fast_math">];
+  let Documentation = [Undocumented];
+}
+
 def VKBufferPointer : InheritableAttr {
   let Spellings = [CXX11<"", "hlsl_vk_buffer_pointer", 2021>];
   let LangOpts = [SPIRV];

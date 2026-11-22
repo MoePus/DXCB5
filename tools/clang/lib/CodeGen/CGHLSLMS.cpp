@@ -18,6 +18,7 @@
 #include "dxc/DXIL/DxilOperations.h"
 #include "dxc/DXIL/DxilTypeSystem.h"
 #include "dxc/DXIL/DxilUtil.h"
+#include "dxc/HLSL/Dxcb5Contract.h"
 #include "dxc/HLSL/HLMatrixType.h"
 #include "dxc/HLSL/HLModule.h"
 #include "dxc/HLSL/HLOperations.h"
@@ -2786,6 +2787,8 @@ void CGMSHLSLRuntime::AddControlFlowHint(CodeGenFunction &CGF, const Stmt &S,
   bool bNoBranchFlatten = true;
   bool bBranch = false;
   bool bFlatten = false;
+  bool bStrictBranch = false;
+  bool bUniformBranch = false;
 
   std::vector<DXIL::ControlFlowHint> hints;
   for (const auto *Attr : Attrs) {
@@ -2793,6 +2796,13 @@ void CGMSHLSLRuntime::AddControlFlowHint(CodeGenFunction &CGF, const Stmt &S,
       hints.emplace_back(DXIL::ControlFlowHint::Branch);
       bNoBranchFlatten = false;
       bBranch = true;
+    } else if (isa<DXCB5StrictBranchAttr>(Attr)) {
+      hints.emplace_back(DXIL::ControlFlowHint::Branch);
+      bNoBranchFlatten = false;
+      bBranch = true;
+      bStrictBranch = true;
+    } else if (isa<DXCB5UniformAttr>(Attr)) {
+      bUniformBranch = true;
     } else if (isa<HLSLFlattenAttr>(Attr)) {
       hints.emplace_back(DXIL::ControlFlowHint::Flatten);
       bNoBranchFlatten = false;
@@ -2825,6 +2835,16 @@ void CGMSHLSLRuntime::AddControlFlowHint(CodeGenFunction &CGF, const Stmt &S,
     // Add meta data to the instruction.
     MDNode *hintsNode = DxilMDHelper::EmitControlFlowHints(Context, hints);
     TI->setMetadata(DxilMDHelper::kDxilControlFlowHintMDName, hintsNode);
+  }
+  if (CGM.getCodeGenOpts().DXCB5PreserveVectors) {
+    if (bStrictBranch) {
+      TI->setMetadata(llvm::dxcb5_contract::kStrictBranchMD,
+                      MDNode::get(Context, None));
+    }
+    if (bUniformBranch) {
+      TI->setMetadata(llvm::dxcb5_contract::kUniformMD,
+                      MDNode::get(Context, None));
+    }
   }
 }
 
@@ -3550,6 +3570,17 @@ uint32_t CGMSHLSLRuntime::AddUAVSRV(VarDecl *decl,
   if (!SetUAVSRV(decl->getLocation(), resClass, hlslRes.get(), VarTy))
     return 0;
 
+  if (CGM.getCodeGenOpts().DXCB5PreserveVectors &&
+      decl->hasAttr<DXCB5DynamicAttr>()) {
+    auto &Module = CGM.getModule();
+    auto &Context = Module.getContext();
+    Metadata *Record[] = {MDString::get(Context, "res"),
+                          MDString::get(Context, decl->getName()),
+                          MDString::get(Context, "dynamic")};
+    Module.getOrInsertNamedMetadata(llvm::dxcb5_contract::kSpecMetaMD)
+        ->addOperand(MDNode::get(Context, Record));
+  }
+
   if (resClass == hlsl::DxilResourceBase::Class::SRV) {
     return m_pHLModule->AddSRV(std::move(hlslRes));
   } else {
@@ -3700,7 +3731,8 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
   AddConstantToCB(cast<llvm::GlobalVariable>(constVal), Name,
                   constDecl->getType(), LowerBound, CB);
 
-  if (!CGM.getLangOpts().HLSLProfileForPreprocessor.empty() &&
+  if (CGM.getCodeGenOpts().DXCB5PreserveVectors &&
+      !CGM.getLangOpts().HLSLProfileForPreprocessor.empty() &&
       constDecl->hasInit()) {
     auto &Module = CGM.getModule();
     auto &Context = Module.getContext();
@@ -3711,8 +3743,59 @@ void CGMSHLSLRuntime::AddConstant(VarDecl *constDecl, HLCBuffer &CB) {
         MDString::get(Context, Name),
         ConstantAsMetadata::get(Value ? Value :
             UndefValue::get(CGM.getTypes().ConvertTypeForMem(constDecl->getType())))};
-    Module.getOrInsertNamedMetadata("dxcb5.cbuffer.defaults")
+    Module.getOrInsertNamedMetadata(llvm::dxcb5_contract::kCBufferDefaultsMD)
         ->addOperand(MDNode::get(Context, Record));
+  }
+
+  // Record [[dxcb5::...]] specialization metadata only under -fdxcb5 (M7), so
+  // stock DXIL compilation never fails MetaUsed/MetaKnown validation.
+  if (CGM.getCodeGenOpts().DXCB5PreserveVectors) {
+    const char *policy = nullptr;
+    llvm::SmallVector<unsigned, 4> specBits;
+    if (constDecl->hasAttr<DXCB5ImmutableAttr>() ||
+        CB.GetGlobalName() == "DXCB5_SpecFlags")
+      policy = "immutable";
+    else if (constDecl->hasAttr<DXCB5SpecConstAttr>())
+      policy = "spec_const";
+    else if (constDecl->hasAttr<DXCB5SpecZeroOneAttr>())
+      policy = "spec_zero_one";
+    else if (constDecl->hasAttr<DXCB5SpecIdentityAttr>())
+      policy = "spec_identity";
+    else if (constDecl->hasAttr<DXCB5DynamicAttr>())
+      policy = "dynamic";
+    else if (const auto *SV = constDecl->getAttr<DXCB5SpecValuesAttr>()) {
+      policy = "spec_values";
+      for (unsigned bits : SV->bitValues())
+        specBits.push_back(bits);
+    }
+    if (policy) {
+      auto &Module = CGM.getModule();
+      auto &Context = Module.getContext();
+      llvm::SmallVector<Metadata *, 8> Record;
+      Record.push_back(MDString::get(Context, "cb"));
+      Record.push_back(MDString::get(Context, CB.GetGlobalName()));
+      Record.push_back(MDString::get(Context, Name));
+      Record.push_back(MDString::get(Context, policy));
+      llvm::Type *I32Ty = llvm::Type::getInt32Ty(Context);
+      for (unsigned bits : specBits)
+        Record.push_back(
+            ConstantAsMetadata::get(ConstantInt::get(I32Ty, bits)));
+      Module.getOrInsertNamedMetadata(llvm::dxcb5_contract::kSpecMetaMD)
+          ->addOperand(MDNode::get(Context, Record));
+      if (strcmp(policy, "immutable") == 0 ||
+          strcmp(policy, "spec_const") == 0) {
+        Metadata *GVRec[] = {MDString::get(Context, constVal->getName())};
+        Module.getOrInsertNamedMetadata(llvm::dxcb5_contract::kSpecBranchGlobalsMD)
+            ->addOperand(MDNode::get(Context, GVRec));
+      }
+    }
+    if (constDecl->hasAttr<DXCB5UniformAttr>()) {
+      auto &Module = CGM.getModule();
+      auto &Context = Module.getContext();
+      Metadata *GVRec[] = {MDString::get(Context, constVal->getName())};
+      Module.getOrInsertNamedMetadata(llvm::dxcb5_contract::kUniformGlobalsMD)
+          ->addOperand(MDNode::get(Context, GVRec));
+    }
   }
 
   // Save fieldAnnotation for the const var.

@@ -486,6 +486,21 @@ void CodeGenFunction::EmitLabelStmt(const LabelStmt &S) {
 }
 
 void CodeGenFunction::EmitAttributedStmt(const AttributedStmt &S) {
+  struct FastMathScopeGuard {
+    bool &Flag;
+    bool Prev;
+    FastMathScopeGuard(bool &F, bool Enable) : Flag(F), Prev(F) {
+      if (Enable)
+        Flag = true;
+    }
+    ~FastMathScopeGuard() { Flag = Prev; }
+  };
+  bool HasFastMath = false;
+  for (const Attr *A : S.getAttrs())
+    if (isa<DXCB5FastMathAttr>(A))
+      HasFastMath = true;
+  FastMathScopeGuard FastMathGuard(InDxcb5FastMath, HasFastMath);
+
   const Stmt *SubStmt = S.getSubStmt();
   switch (SubStmt->getStmtClass()) {
   case Stmt::DoStmtClass:

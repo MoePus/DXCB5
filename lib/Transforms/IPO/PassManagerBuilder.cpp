@@ -27,6 +27,7 @@
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Vectorize.h"
 #include "dxc/HLSL/DxilGenerationPass.h" // HLSL Change
+#include "dxc/HLSL/Dxcb5Contract.h" // HLSL Change
 #include "dxc/HLSL/HLMatrixLowerPass.h" // HLSL Change
 #include "dxc/HLSL/ComputeViewIdState.h" // HLSL Change
 #include "llvm/Analysis/DxilValueCache.h" // HLSL Change
@@ -279,6 +280,9 @@ void PassManagerBuilder::addHLSLPasses(legacy::PassManagerBase &MPM) {
 
   if (!NoOpt)
     MPM.add(createSimplifyInstPass());
+
+  if (DXCB5PreserveVectors)
+    MPM.add(createDxcb5PipelineContractPass());
 
   if (!NoOpt)
     MPM.add(createCFGSimplificationPass());

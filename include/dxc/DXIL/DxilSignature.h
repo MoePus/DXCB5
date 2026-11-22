@@ -27,6 +27,7 @@ public:
                 bool useMinPrecision);
   DxilSignature(DXIL::SigPointKind sigPointKind, bool useMinPrecision);
   DxilSignature(const DxilSignature &src);
+  DxilSignature &operator=(DxilSignature &&) = default;
   virtual ~DxilSignature();
 
   bool IsInput() const;

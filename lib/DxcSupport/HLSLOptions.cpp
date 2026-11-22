@@ -505,9 +505,11 @@ static bool ValidateDxcb5Options(const InputArgList &args,
                                  unsigned flagsToInclude, const DxcOpts &opts,
                                  llvm::raw_ostream &errors) {
   if (!opts.Dxcb5) {
-    if (!args.hasArg(OPT_dxcb5_vs_dxbc, OPT_fdxcb5_cache, OPT_dxcb5_nan_safe))
+    if (!args.hasArg(OPT_dxcb5_vs_dxbc, OPT_fdxcb5_cache, OPT_dxcb5_nan_safe) &&
+        !args.hasArg(OPT_fdxcb5_emit_uber_dxil))
       return true;
-    errors << "--vs-dxbc, --nan-safe, and -fdxcb5-cache are only supported by DXCB5.";
+    errors << "--vs-dxbc, --nan-safe, -fdxcb5-cache, and "
+              "-fdxcb5-emit-uber-dxil are only supported by DXCB5.";
     return false;
   }
 
@@ -602,6 +604,7 @@ int ReadDxcOpts(const OptTable *optionTable, unsigned flagsToInclude,
 
   opts.Dxcb5 = Args.hasArg(OPT_fdxcb5);
   opts.Dxcb5Cache = Args.hasArg(OPT_fdxcb5_cache);
+  opts.Dxcb5EmitUberDxil = Args.hasArg(OPT_fdxcb5_emit_uber_dxil);
   opts.Dxcb5NanSafe = Args.hasArg(OPT_dxcb5_nan_safe);
   opts.ShowHelp = Args.hasFlag(OPT_help, OPT_INVALID, false);
   opts.ShowHelp |= (opts.ShowHelpHidden =

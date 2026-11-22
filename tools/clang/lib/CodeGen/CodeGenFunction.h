@@ -285,6 +285,9 @@ public:
   /// finally block or filter expression.
   bool IsOutlinedSEHHelper;
 
+  /// True if the current function is annotated with [[dxcb5::fast_math]].
+  bool InDxcb5FastMath;
+
   const CodeGen::CGBlockInfo *BlockInfo;
   llvm::Value *BlockPointer;
 

@@ -286,6 +286,8 @@ def fdxcb5 : Flag<["-"], "fdxcb5">, Flags<[CoreOption, HelpHidden]>,
   Group<hlslcore_Group>;
 def fdxcb5_cache : Flag<["-"], "fdxcb5-cache">, Flags<[CoreOption, HelpHidden]>,
   Group<hlslcore_Group>;
+def fdxcb5_emit_uber_dxil : Flag<["-"], "fdxcb5-emit-uber-dxil">,
+  Flags<[CoreOption, HelpHidden]>, Group<hlslcore_Group>;
 def dxcb5_vs_dxbc : Separate<["--"], "vs-dxbc">, Flags<[CoreOption]>,
   MetaVarName<"<file>">, Group<hlslcomp_Group>,
   HelpText<"DXCB5: Input vertex shader bytecode for ps_5_0">;

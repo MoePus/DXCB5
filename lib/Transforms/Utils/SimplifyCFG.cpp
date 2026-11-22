@@ -11,6 +11,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "dxc/HLSL/Dxcb5Contract.h" // HLSL Change
 #include "llvm/Transforms/Utils/Local.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -1971,6 +1972,11 @@ static bool FoldTwoEntryPHINode(PHINode *PN, const TargetTransformInfo &TTI,
 static bool SimplifyCondBranchToTwoReturns(BranchInst *BI,
                                            IRBuilder<> &Builder) {
   assert(BI->isConditional() && "Must be a conditional branch");
+  // DXCB5 Change Begins: preserve [[dxcb5::strict_branch]] and auto spec branches.
+  if (BI->getMetadata(dxcb5_contract::kStrictBranchMD) ||
+      BI->getMetadata(dxcb5_contract::kAutoBranchMD))
+    return false;
+  // DXCB5 Change Ends.
   BasicBlock *TrueSucc = BI->getSuccessor(0);
   BasicBlock *FalseSucc = BI->getSuccessor(1);
   ReturnInst *TrueRet = cast<ReturnInst>(TrueSucc->getTerminator());

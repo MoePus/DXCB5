@@ -33,6 +33,7 @@
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/IR/Operator.h"
 #include "dxc/DXIL/DxilMetadataHelper.h" // HLSL Change
+#include "dxc/HLSL/Dxcb5Contract.h"      // DXCB5 Change
 using namespace clang;
 using namespace CodeGen;
 
@@ -43,7 +44,7 @@ CodeGenFunction::CodeGenFunction(CodeGenModule &cgm, bool suppressNewContext)
       CurFn(nullptr), CapturedStmtInfo(nullptr),
       SanOpts(CGM.getLangOpts().Sanitize), IsSanitizerScope(false),
       CurFuncIsThunk(false), AutoreleaseResult(false), SawAsmBlock(false),
-      IsOutlinedSEHHelper(false), BlockInfo(nullptr), BlockPointer(nullptr),
+      IsOutlinedSEHHelper(false), InDxcb5FastMath(false), BlockInfo(nullptr), BlockPointer(nullptr),
       LambdaThisCaptureField(nullptr), NormalCleanupDest(nullptr),
       NextCleanupDestIndex(1), FirstBlockInfo(nullptr), EHResumeBlock(nullptr),
       ExceptionSlot(nullptr), EHSelectorSlot(nullptr),
@@ -645,6 +646,9 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
   // declaration. Also, in the case of -fno-inline attach NoInline
   // attribute to all function that are not marked AlwaysInline.
   if (const FunctionDecl *FD = dyn_cast_or_null<FunctionDecl>(D)) {
+    for (auto RI : FD->redecls())
+      if (RI->hasAttr<DXCB5FastMathAttr>())
+        InDxcb5FastMath = true;
     if (!CGM.getCodeGenOpts().NoInline) {
       for (auto RI : FD->redecls())
         if (RI->isInlineSpecified()) {
@@ -1803,6 +1807,18 @@ void CodeGenFunction::InsertHelper(llvm::Instruction *I,
   LoopStack.InsertHelper(I);
   if (IsSanitizerScope)
     CGM.getSanitizerMetadata()->disableSanitizerForInstruction(I);
+  if (InDxcb5FastMath && CGM.getCodeGenOpts().DXCB5PreserveVectors) {
+    if (auto *CI = dyn_cast<llvm::CallInst>(I)) {
+      llvm::Function *Callee = CI->getCalledFunction();
+      if (!Callee || !Callee->isIntrinsic())
+        CI->setMetadata(llvm::dxcb5_contract::kFastMathMD,
+                        llvm::MDNode::get(I->getContext(), llvm::None));
+    } else if (isa<llvm::BinaryOperator>(I) &&
+               I->getType()->isFPOrFPVectorTy()) {
+      I->setMetadata(llvm::dxcb5_contract::kFastMathMD,
+                     llvm::MDNode::get(I->getContext(), llvm::None));
+    }
+  }
 }
 
 template <bool PreserveNames>

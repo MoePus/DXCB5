@@ -141,6 +141,7 @@ public:
   llvm::StringRef Dxcb5VertexBytecode;         // OPT_dxcb5_vs_dxbc
   bool Dxcb5 = false;                          // OPT_fdxcb5
   bool Dxcb5Cache = false;                     // OPT_fdxcb5_cache
+  bool Dxcb5EmitUberDxil = false;              // OPT_fdxcb5_emit_uber_dxil
   bool Dxcb5NanSafe = false;                   // OPT_dxcb5_nan_safe
   llvm::StringRef VariableName;               // OPT_Vn
   llvm::StringRef PrivateSource;              // OPT_setprivate
