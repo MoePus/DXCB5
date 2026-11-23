@@ -79,6 +79,8 @@ struct samplerCUBE { TextureCube<float4> t; SamplerState s; };
 struct sampler2DShadow { Texture2D<float> t; SamplerComparisonState s; };
 #define sampler2D_half sampler2D
 #define sampler2D_float sampler2D
+#define sampler2D_f sampler2D
+#define sampler2D_h sampler2D
 #define sampler3D_half sampler3D
 #define sampler3D_float sampler3D
 #define samplerCUBE_half samplerCUBE
@@ -126,8 +128,18 @@ std::vector<Token> Tokenize(const char *src, size_t len) {
       continue;
     }
     if (lineStart && c == '#') {
-      while (i < len && src[i] != '\n')
+      while (i < len) {
+        if (src[i] == '\\' && i + 1 < len) {
+          if (src[i + 1] == '\n') { i += 2; continue; }
+          if (src[i + 1] == '\r' && i + 2 < len && src[i + 2] == '\n') {
+            i += 3;
+            continue;
+          }
+        }
+        if (src[i] == '\n')
+          break;
         ++i;
+      }
       continue;
     }
     lineStart = false;
@@ -247,6 +259,22 @@ bool AdaptUnityHlslForDxc(const char *src, size_t len, std::string &out,
   const auto toks = Tokenize(src, len);
   std::vector<Edit> edits;
   std::unordered_map<std::string, GlobalSampler> globals;
+  std::unordered_map<std::string, bool> existingSamplers;
+  {
+    int bd = 0, pd = 0;
+    for (size_t k = 0; k < toks.size(); ++k) {
+      if (toks[k].Punct == '{') { ++bd; continue; }
+      if (toks[k].Punct == '}') { if (bd > 0) --bd; continue; }
+      if (toks[k].Punct == '(') { ++pd; continue; }
+      if (toks[k].Punct == ')') { if (pd > 0) --pd; continue; }
+      if (bd == 0 && pd == 0 && toks[k].IsIdent && k + 1 < toks.size() &&
+          toks[k + 1].IsIdent) {
+        const std::string ty = TokStr(src, toks[k]);
+        if (ty == "SamplerState" || ty == "SamplerComparisonState")
+          existingSamplers[TokStr(src, toks[k + 1])] = true;
+      }
+    }
+  }
 
   int braceDepth = 0;
   int parenDepth = 0;
@@ -311,13 +339,18 @@ bool AdaptUnityHlslForDxc(const char *src, size_t len, std::string &out,
       replacement += name;
       if (!slot.empty())
         replacement += " : register(t" + slot + ")";
-      replacement += "; ";
-      replacement += SamplerStateTypeName(kind);
-      replacement += " sampler";
-      replacement += name;
-      if (!slot.empty())
-        replacement += " : register(s" + slot + ")";
       replacement += ";";
+      const std::string sampName = "sampler" + name;
+      if (!existingSamplers.count(sampName)) {
+        replacement += " ";
+        replacement += SamplerStateTypeName(kind);
+        replacement += " ";
+        replacement += sampName;
+        if (!slot.empty())
+          replacement += " : register(s" + slot + ")";
+        replacement += ";";
+        existingSamplers[sampName] = true;
+      }
       names.push_back(name);
       if (j < toks.size() && toks[j].Punct == ',') {
         ++j;
@@ -341,20 +374,66 @@ bool AdaptUnityHlslForDxc(const char *src, size_t len, std::string &out,
     i = j;
   }
 
-  // Rewrite expression references to each rewritten global sampler variable.
+  // Rewrite expression references to each rewritten global sampler variable,
+  // skipping shadowed function parameters and local declarations.
   if (!globals.empty()) {
+    std::vector<std::vector<std::string>> scopeShadows;
+    std::unordered_map<std::string, int> shadowDepth;
+    std::vector<std::string> pendingParamShadows;
+    int fnBraceDepth = 0;
+    int parenLvl = 0;
     for (size_t i = 0; i < toks.size(); ++i) {
       const Token &t = toks[i];
+      if (t.Punct == '(') { ++parenLvl; continue; }
+      if (t.Punct == ')') { if (parenLvl > 0) --parenLvl; continue; }
+      if (t.Punct == '{') {
+        ++fnBraceDepth;
+        scopeShadows.emplace_back();
+        if (fnBraceDepth == 1 && !pendingParamShadows.empty()) {
+          for (const auto &nm : pendingParamShadows) {
+            scopeShadows.back().push_back(nm);
+            ++shadowDepth[nm];
+          }
+          pendingParamShadows.clear();
+        }
+        continue;
+      }
+      if (t.Punct == '}') {
+        if (!scopeShadows.empty()) {
+          for (const auto &nm : scopeShadows.back())
+            --shadowDepth[nm];
+          scopeShadows.pop_back();
+        }
+        if (fnBraceDepth > 0)
+          --fnBraceDepth;
+        continue;
+      }
+      if (t.Punct == ';' && fnBraceDepth == 0) {
+        pendingParamShadows.clear();
+        continue;
+      }
       if (!t.IsIdent)
         continue;
       if (i > 0 && toks[i - 1].Punct == '.')
         continue;
-      const auto it = globals.find(TokStr(src, t));
+      const std::string name = TokStr(src, t);
+      const auto it = globals.find(name);
       if (it == globals.end() || t.Pos < it->second.DeclEnd)
         continue;
-      // Do not rewrite function parameters or local variable declarations.
-      if (i > 0 && toks[i - 1].IsIdent &&
-          ClassifySamplerType(TokStr(src, toks[i - 1])) != SamplerKind::None)
+      // Parameter or local variable declaration: `<Type> <name>` (not `return <name>`).
+      const bool precededByType =
+          i > 0 && toks[i - 1].IsIdent && TokStr(src, toks[i - 1]) != "return" &&
+          TokStr(src, toks[i - 1]) != "case";
+      if (precededByType) {
+        if (fnBraceDepth == 0 && parenLvl > 0)
+          pendingParamShadows.push_back(name);
+        else if (!scopeShadows.empty()) {
+          scopeShadows.back().push_back(name);
+          ++shadowDepth[name];
+        }
+        continue;
+      }
+      if (shadowDepth[name] > 0)
         continue;
       std::string call = HelperCtorName(it->second.Kind);
       call += "(";

@@ -1,21 +1,23 @@
 # DXCB5 Shader Compiler for Unity (VCC Package)
 
-Replaces Unity 2022.3's D3D11 SM5.0 `vs_5_0` / `ps_5_0` FXC compiler with **DXCB5** via a safe `D3DCompiler_47.dll` proxy inside `Editor/Data/Tools/`.
+Compiles Unity 2022.3 D3D11 SM5.0 `vs_5_0` / `ps_5_0` shaders with **DXCB5**, with automatic fallback to Unity's stock FXC for non-VS/PS stages (`cs_5_0`, `gs_5_0`, `hs_5_0`, `ds_5_0`), unsupported features (e.g. `double`), or front-end errors.
 
 - **Target Unity**: `2022.3.22f1` (and other `2022.3.x` Windows x64 Editors)
-- **Automatic FXC fallback**: Non-VS/PS stages (`cs_5_0`, `gs_5_0`, `hs_5_0`, `ds_5_0`), unsupported features (e.g. `double`), or any DXC front-end error automatically fall back to the backed-up original `D3DCompiler_47_fxc.dll`.
-- **Reversible**: Original `D3DCompiler_47.dll` is backed up once to `D3DCompiler_47_fxc.dll` and can be restored in one click.
+- **Non-invasive & Project-Scoped**: Loads in-process inside the Unity Editor (`dxcb5_unity_hook.dll` + `dxcb5_cgbatch_plugin.dll`) without modifying Unity's installation directory or requiring administrator privileges.
+- **In-Process RAM Variant Deduplication**: On Unity `2022.3.22f1`, caches compiled snippets and reflection in Editor RAM to skip redundant `UnityShaderCompiler.exe` IPC compiles.
 
 ## Usage
 
 1. Add this package to your project via VRChat Creator Companion (VCC) or Unity Package Manager.
-2. In Unity, open **`Tools -> DXCB5 Shader Compiler`**.
-3. Click **Install DXCB5 Proxy** (Windows UAC prompt will appear if Unity is installed under `Program Files`).
-4. Optionally click **Clear ShaderCache** or reimport your shaders to compile them with DXCB5.
-5. Toggle **Enable DXCB5** or **`--nan-safe`** at any time without restarting Unity.
+2. Open your Unity project — DXCB5 activates automatically on Editor load.
+3. Open **`Tools -> DXCB5 Shader Compiler`** to inspect status, view session statistics (`Workers Hooked`, `RAM Hits`, `IPC Compiles`), clear caches, or toggle **Enable DXCB5** / **`--nan-safe`** at any time without restarting Unity.
+4. Optionally click **Clear Project Library/ShaderCache** to recompile previously cached shaders with DXCB5.
 
-## Uninstalling / Restoring FXC
+## Uninstalling
 
-- **In Unity**: Open **`Tools -> DXCB5 Shader Compiler`** and click **Uninstall & Restore FXC** (restores `D3DCompiler_47_fxc.dll` back to `D3DCompiler_47.dll` and removes `dxcb5_dxcompiler.dll`).
-- **Removed directly via VCC**: By default (*Project-scoped only*), the proxy automatically bypasses DXCB5 and routes 100% directly to stock FXC for any project that no longer has `com.moepus.dxcb5` installed. To also physically restore `Editor/Data/Tools/D3DCompiler_47.dll` outside Unity, run `%LOCALAPPDATA%\DXCB5Unity\Restore_FXC.cmd`.
-- To recompile previously cached shaders with FXC, clear `Library/ShaderCache` in your Unity project.
+- Remove `com.moepus.dxcb5` from your project via VCC or Unity Package Manager. Unity's installation directory is never modified.
+- To recompile previously cached shaders with stock FXC, delete `Library/ShaderCache` in your Unity project.
+
+## Third-Party Notices
+
+Includes [MinHook](https://github.com/TsudaKageyu/minhook) v1.3.4 (BSD 2-Clause License).

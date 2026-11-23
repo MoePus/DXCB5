@@ -5,11 +5,13 @@ add_llvm_library(DXCB5Backend
   lib/Emit/DxbcParts.cpp
   lib/Emit/DxbcWriter.cpp
   lib/Emit/MirText.cpp
+  lib/Emit/Oracle.cpp
   lib/ControlFlow/ControlFlow.cpp
   lib/ControlFlow/ControlFlowDispatch.cpp
   lib/ControlFlow/ControlFlowMovPeephole.cpp
   lib/ControlFlow/ControlFlowNormalize.cpp
   lib/ControlFlow/ControlFlowPeephole.cpp
+  lib/ControlFlow/ControlFlowPostRa.cpp
   lib/ControlFlow/ControlFlowRegions.cpp
   lib/ControlFlow/ParallelCopy.cpp
   lib/Frontend/Import.cpp
@@ -20,34 +22,52 @@ add_llvm_library(DXCB5Backend
   lib/Frontend/LowerToSsaMir.cpp
   lib/Frontend/LowerToSsaMirInsts.cpp
   lib/Frontend/PackLocalConstants.cpp
-  lib/Mir/OptAlgebraic.cpp
-  lib/Mir/OptCombineBitfield.cpp
-  lib/Mir/OptCombineFloat.cpp
-  lib/Mir/OptCombineFloatAdd.cpp
-  lib/Mir/OptCombineInt.cpp
-  lib/Mir/OptCombineSelect.cpp
-  lib/Mir/OptCopyProp.cpp
-  lib/Mir/OptDce.cpp
-  lib/Mir/OptGlobalCombine.cpp
+  lib/Mir/Analysis/DemandedLanes.cpp
+  lib/Mir/Analysis/LaneAnalysis.cpp
+  lib/Mir/Analysis/LaneValueFacts.cpp
+  lib/Mir/Combine/CombineBitfield.cpp
+  lib/Mir/Combine/CombineFloat.cpp
+  lib/Mir/Combine/CombineFloatAdd.cpp
+  lib/Mir/Combine/CombineGlobal.cpp
+  lib/Mir/Combine/CombineInt.cpp
+  lib/Mir/Combine/CombineSelect.cpp
+  lib/Mir/Combine/CopyProp.cpp
+  lib/Mir/Combine/SelectDots.cpp
+  lib/Mir/Combine/SelectDotsHoriz.cpp
+  lib/Mir/Combine/WorklistCombine.cpp
+  lib/Mir/Memory/IndexableCopy.cpp
+  lib/Mir/Memory/IndexablePack.cpp
+  lib/Mir/Memory/IndexablePlan.cpp
+  lib/Mir/Memory/IndexableSsa.cpp
+  lib/Mir/Memory/IndexableTemps.cpp
+  lib/Mir/OptColdSink.cpp
+  lib/Mir/OptFoldOutputs.cpp
   lib/Mir/OptGvnDce.cpp
   lib/Mir/OptIfConvert.cpp
-  lib/Mir/OptIndexableCopy.cpp
-  lib/Mir/OptIndexablePack.cpp
-  lib/Mir/OptIndexablePlan.cpp
-  lib/Mir/OptIndexableSsa.cpp
-  lib/Mir/OptIndexableTemps.cpp
-  lib/Mir/OptLocalArrays.cpp
+  lib/Mir/OptLicm.cpp
+  lib/Mir/OptLoopPeel.cpp
   lib/Mir/OptPipeline.cpp
-  lib/Mir/OptSelectDots.cpp
-  lib/Mir/OptSelectDotsHoriz.cpp
+  lib/Mir/OptPressureShrink.cpp
   lib/Mir/OptSlpTree.cpp
   lib/Mir/OptSlpVectorize.cpp
   lib/Mir/OutOfSsa.cpp
+  lib/Mir/SsaAnalysis.cpp
   lib/Mir/SsaMir.cpp
   lib/RegAlloc/LaneAllocator.cpp
   lib/RegAlloc/LaneInterference.cpp
   lib/RegAlloc/Liveness.cpp
   lib/RegAlloc/RegisterAllocation.cpp
+  lib/RegAlloc/VerifyAllocation.cpp
+  lib/Spec/DxilMathConstEval.cpp
+  lib/Spec/SpecCrossStage.cpp
+  lib/Spec/SpecDriver.cpp
+  lib/Spec/SpecCBufferCompact.cpp
+  lib/Spec/SpecCBufferLayout.cpp
+  lib/Spec/SpecHash.cpp
+  lib/Spec/SpecJson.cpp
+  lib/Spec/SpecReflect.cpp
+  lib/Spec/SpecTextureFold.cpp
+  lib/Spec/SpecTransform.cpp
 )
 
 target_include_directories(DXCB5Backend
@@ -55,34 +75,66 @@ target_include_directories(DXCB5Backend
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/lib"
 )
 target_link_libraries(DXCB5Backend PRIVATE
-  ShaderBinary LLVMAnalysis LLVMDXIL LLVMDxilContainer LLVMDxilHash LLVMDxilRootSignature LLVMTransformUtils
+  ShaderBinary LLVMAnalysis LLVMBitReader LLVMBitWriter LLVMDXIL LLVMDxilContainer LLVMDxilHash LLVMDxilRootSignature LLVMInstCombine LLVMScalarOpts LLVMTransformUtils
 )
 
 add_llvm_executable(dxcb5 tools/Main.cpp)
-target_include_directories(dxcb5 PRIVATE "${LLVM_MAIN_SRC_DIR}/tools/clang/tools")
+target_include_directories(dxcb5 PRIVATE
+  "${LLVM_MAIN_SRC_DIR}/tools/clang/tools"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_link_libraries(dxcb5 PRIVATE dxclib dxcompiler)
 install(TARGETS dxcb5 RUNTIME DESTINATION bin)
 
-add_library(DXCB5UnityProxy SHARED
-  unity-proxy/D3DCompilerProxy.cpp
-  unity-proxy/D3DCompilerForward.cpp
-  unity-proxy/UnityHlslAdapter.cpp
-  unity-proxy/D3DCompiler_47.def
+add_library(DXCB5MinHook STATIC
+  third_party/minhook/src/buffer.c
+  third_party/minhook/src/hook.c
+  third_party/minhook/src/trampoline.c
+  third_party/minhook/src/hde/hde64.c
 )
-target_include_directories(DXCB5UnityProxy PRIVATE "${LLVM_MAIN_SRC_DIR}/include")
-target_compile_options(DXCB5UnityProxy PRIVATE /EHsc)
-set_target_properties(DXCB5UnityProxy PROPERTIES
-  OUTPUT_NAME "D3DCompiler_47"
-  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/unity-proxy"
+target_include_directories(DXCB5MinHook PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/third_party/minhook/include")
+target_compile_options(DXCB5MinHook PRIVATE /w)
+
+add_library(DXCB5UnityHook SHARED
+  unity-hook/UnityHookMain.cpp
 )
-add_executable(DXCB5UnityProxyTest tests/UnityProxyTest.cpp)
-target_compile_options(DXCB5UnityProxyTest PRIVATE /EHsc)
-target_link_libraries(DXCB5UnityProxyTest PRIVATE d3d11)
-add_test(NAME DXCB5UnityProxy COMMAND DXCB5UnityProxyTest
-  "$<TARGET_FILE:DXCB5UnityProxy>"
-  "$ENV{SystemRoot}/System32/D3DCompiler_47.dll"
+target_include_directories(DXCB5UnityHook PRIVATE
+  "${LLVM_MAIN_SRC_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/unity-hook")
+target_compile_options(DXCB5UnityHook PRIVATE /EHsc)
+target_link_libraries(DXCB5UnityHook PRIVATE DXCB5MinHook)
+set_target_properties(DXCB5UnityHook PROPERTIES
+  OUTPUT_NAME "dxcb5_unity_hook"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/unity-hook"
+)
+
+add_library(DXCB5CgBatchPlugin SHARED
+  unity-hook/CgBatchPlugin.cpp
+  unity-hook/UnityHlslAdapter.cpp
+)
+target_include_directories(DXCB5CgBatchPlugin PRIVATE
+  "${LLVM_MAIN_SRC_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/unity-hook")
+target_compile_options(DXCB5CgBatchPlugin PRIVATE /EHsc)
+set_target_properties(DXCB5CgBatchPlugin PROPERTIES
+  OUTPUT_NAME "dxcb5_cgbatch_plugin"
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/unity-hook"
+)
+
+add_executable(DXCB5UnityHookTest tests/UnityHookTest.cpp)
+target_include_directories(DXCB5UnityHookTest PRIVATE
+  "${LLVM_MAIN_SRC_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/unity-hook")
+target_compile_options(DXCB5UnityHookTest PRIVATE /EHsc)
+target_link_libraries(DXCB5UnityHookTest PRIVATE DXCB5MinHook d3d11 d3dcompiler)
+add_test(NAME DXCB5UnityHook COMMAND DXCB5UnityHookTest
+  "$<TARGET_FILE:DXCB5UnityHook>"
+  "$<TARGET_FILE:DXCB5CgBatchPlugin>"
   "$<TARGET_FILE:dxcompiler>"
-  "${CMAKE_CURRENT_BINARY_DIR}/unity-proxy-test")
+  "${CMAKE_CURRENT_BINARY_DIR}/unity-hook-test")
 
 add_executable(DXCB5ParallelCopyTest tests/ParallelCopyTest.cpp lib/ControlFlow/ParallelCopy.cpp)
 target_include_directories(DXCB5ParallelCopyTest PRIVATE include)
@@ -91,6 +143,16 @@ add_executable(DXCB5CompileSessionTest tests/CompileSessionTest.cpp)
 target_compile_options(DXCB5CompileSessionTest PRIVATE /EHsc)
 target_link_libraries(DXCB5CompileSessionTest PRIVATE dxcompiler)
 add_test(NAME DXCB5CompileSession COMMAND DXCB5CompileSessionTest)
+add_executable(DXCB5SpecApiTest tests/SpecApiTest.cpp)
+target_include_directories(DXCB5SpecApiTest PRIVATE
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+  "${CMAKE_CURRENT_SOURCE_DIR}/unity-hook")
+target_compile_options(DXCB5SpecApiTest PRIVATE /EHsc)
+target_link_libraries(DXCB5SpecApiTest PRIVATE dxcompiler d3dcompiler)
+add_test(NAME DXCB5SpecApi COMMAND DXCB5SpecApiTest
+  "$<TARGET_FILE:DXCB5CgBatchPlugin>"
+  "$<TARGET_FILE:dxcompiler>"
+  "${CMAKE_CURRENT_BINARY_DIR}/spec-api-test")
 add_executable(DXCB5LoopRegionValuesTest tests/LoopRegionValuesTest.cpp)
 target_link_libraries(DXCB5LoopRegionValuesTest PRIVATE DXCB5Backend LLVMAsmParser LLVMDxcSupport)
 add_test(NAME DXCB5LoopRegionValues COMMAND DXCB5LoopRegionValuesTest)
@@ -136,25 +198,12 @@ add_test(NAME DXCB5Frontend COMMAND "${CMAKE_COMMAND}"
   -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/FrontendTest.cmake")
 
 add_executable(DXCB5WarpABITest tests/WarpABITest.cpp)
-add_executable(DXCB5MoeToonWarp EXCLUDE_FROM_ALL tests/MoeToonWarp.cpp)
-foreach(test DXCB5WarpABITest DXCB5MoeToonWarp)
-  target_compile_options(${test} PRIVATE /EHsc)
-  target_link_libraries(${test} PRIVATE d3d11 d3dcompiler)
-endforeach()
+target_compile_options(DXCB5WarpABITest PRIVATE /EHsc)
+target_link_libraries(DXCB5WarpABITest PRIVATE d3d11 d3dcompiler)
 add_test(NAME DXCB5WarpABI COMMAND "${CMAKE_COMMAND}"
   "-DWARP_TEST=$<TARGET_FILE:DXCB5WarpABITest>" "-DDXCB5=$<TARGET_FILE:dxcb5>"
   "-DDIRECT_TEST=$<TARGET_FILE:DXCB5DirectDxilTest>"
   "-DTEST_DIR=${CMAKE_CURRENT_BINARY_DIR}/warp-abi-test"
   -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/WarpABITest.cmake")
-
-set(DXCB5_UNITY_PLUGIN_API "" CACHE PATH "Path to Unity Editor's PluginAPI headers")
-if(DXCB5_UNITY_PLUGIN_API)
-  add_library(DXCB5MoeToonUnity SHARED EXCLUDE_FROM_ALL
-    tests/MoeToonWarp.cpp tests/MoeToonUnityPlugin.cpp)
-  target_include_directories(DXCB5MoeToonUnity PRIVATE "${DXCB5_UNITY_PLUGIN_API}")
-  target_compile_definitions(DXCB5MoeToonUnity PRIVATE DXCB5_UNITY_RENDER_PLUGIN)
-  target_compile_options(DXCB5MoeToonUnity PRIVATE /EHsc /utf-8)
-  target_link_libraries(DXCB5MoeToonUnity PRIVATE d3d11 d3dcompiler)
-endif()
 
 include("${CMAKE_CURRENT_SOURCE_DIR}/lean/LeanGate.cmake")

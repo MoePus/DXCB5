@@ -1,6 +1,6 @@
 param(
-    [string]$BuildDir = "F:\.codex-tmp\dxcb5-x64",
-    [string]$OutDir = "F:\.codex-tmp\dxcb5-vcc-dist",
+    [string]$BuildDir = "",
+    [string]$OutDir = "",
     [string]$RepoUrl = "https://moepus.github.io/vpm",
     [string]$DownloadBaseUrl = "https://github.com/MoePus/DXCB5/releases/download",
     [string]$Version = "",
@@ -9,6 +9,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+if ([string]::IsNullOrWhiteSpace($BuildDir)) {
+    $BuildDir = Join-Path $repoRoot "build"
+}
+if ([string]::IsNullOrWhiteSpace($OutDir)) {
+    $OutDir = Join-Path $repoRoot "dist"
+}
+
 $pkgSrc = Join-Path $PSScriptRoot "com.moepus.dxcb5"
 $manifestPath = Join-Path $pkgSrc "package.json"
 $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
@@ -16,14 +24,18 @@ $pkgName = $manifest.name
 $effectiveVersion = if ([string]::IsNullOrWhiteSpace($Version)) { $manifest.version } else { $Version.Trim() }
 $effectiveTag = if ([string]::IsNullOrWhiteSpace($TagName)) { "v$effectiveVersion" } else { $TagName.Trim() }
 
-$proxyDll = Join-Path $BuildDir "bin\unity-proxy\D3DCompiler_47.dll"
 $dxcDll = Join-Path $BuildDir "bin\dxcompiler.dll"
+$unityHookDll = Join-Path $BuildDir "bin\unity-hook\dxcb5_unity_hook.dll"
+$cgBatchPluginDll = Join-Path $BuildDir "bin\unity-hook\dxcb5_cgbatch_plugin.dll"
 
-if (-not (Test-Path -LiteralPath $proxyDll)) {
-    throw "Missing built proxy DLL: $proxyDll (build target DXCB5UnityProxy first)"
-}
 if (-not (Test-Path -LiteralPath $dxcDll)) {
     throw "Missing built dxcompiler DLL: $dxcDll (build target dxcompiler first)"
+}
+if (-not (Test-Path -LiteralPath $unityHookDll)) {
+    throw "Missing built unity hook DLL: $unityHookDll (build target DXCB5UnityHook first)"
+}
+if (-not (Test-Path -LiteralPath $cgBatchPluginDll)) {
+    throw "Missing built CgBatch plugin DLL: $cgBatchPluginDll (build target DXCB5CgBatchPlugin first)"
 }
 
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
@@ -47,55 +59,66 @@ $nativeParent = Join-Path $stageDir "Editor\Native"
 $nativeDir = Join-Path $nativeParent "win-x64"
 New-Item -ItemType Directory -Force -Path $nativeDir | Out-Null
 
-$folderMeta1 = @"
+function Write-DefaultMeta([string]$Path, [string]$Guid, [switch]$Folder) {
+    $folderLine = if ($Folder) { "folderAsset: yes`n" } else { "" }
+    $meta = @"
 fileFormatVersion: 2
-guid: d5c8b50147a04b219f30000000000020
-folderAsset: yes
-DefaultImporter:
+guid: $Guid
+${folderLine}DefaultImporter:
   externalObjects: {}
-  userData: 
-  assetBundleName: 
-  assetBundleVariant: 
+  userData:
+  assetBundleName:
+  assetBundleVariant:
 "@
-$folderMeta2 = @"
-fileFormatVersion: 2
-guid: d5c8b50147a04b219f30000000000021
-folderAsset: yes
-DefaultImporter:
-  externalObjects: {}
-  userData: 
-  assetBundleName: 
-  assetBundleVariant: 
-"@
-[System.IO.File]::WriteAllText("$nativeParent.meta", $folderMeta1, $utf8NoBom)
-[System.IO.File]::WriteAllText("$nativeDir.meta", $folderMeta2, $utf8NoBom)
+    [System.IO.File]::WriteAllText($Path, $meta, $utf8NoBom)
+}
 
-$dstProxyBin = Join-Path $nativeDir "D3DCompiler_47.dll.bin"
+Write-DefaultMeta "$nativeParent.meta" "d5c8b50147a04b219f30000000000020" -Folder
+Write-DefaultMeta "$nativeDir.meta" "d5c8b50147a04b219f30000000000021" -Folder
+
 $dstDxcBin = Join-Path $nativeDir "dxcb5_dxcompiler.dll.bin"
-Copy-Item -LiteralPath $proxyDll -Destination $dstProxyBin -Force
+$dstCgBatchBin = Join-Path $nativeDir "dxcb5_cgbatch_plugin.dll.bin"
+$dstUnityHookDll = Join-Path $nativeDir "dxcb5_unity_hook.dll"
 Copy-Item -LiteralPath $dxcDll -Destination $dstDxcBin -Force
+Copy-Item -LiteralPath $cgBatchPluginDll -Destination $dstCgBatchBin -Force
+Copy-Item -LiteralPath $unityHookDll -Destination $dstUnityHookDll -Force
 
-# Deterministic DefaultAsset .meta files so Unity never auto-loads these binaries into Unity.exe
-$proxyMeta = @"
+# Deterministic DefaultAsset .meta files so Unity never auto-loads worker binaries into Unity.exe,
+# plus Editor-only x64 PluginImporter .meta for dxcb5_unity_hook.dll.
+Write-DefaultMeta "$dstDxcBin.meta" "d5c8b50147a04b219f30000000000102"
+Write-DefaultMeta "$dstCgBatchBin.meta" "d5c8b50147a04b219f30000000000103"
+$unityHookMeta = @"
 fileFormatVersion: 2
-guid: d5c8b50147a04b219f30000000000101
-DefaultImporter:
+guid: d5c8b50147a04b219f30000000000104
+PluginImporter:
   externalObjects: {}
-  userData: 
-  assetBundleName: 
-  assetBundleVariant: 
+  serializedVersion: 2
+  iconMap: {}
+  executionOrder: {}
+  defineConstraints: []
+  isPreloaded: 0
+  isOverridable: 0
+  isExplicitlyReferenced: 0
+  validateReferences: 1
+  platformData:
+  - first:
+      Any:
+    second:
+      enabled: 0
+      settings: {}
+  - first:
+      Editor: Editor
+    second:
+      enabled: 1
+      settings:
+        CPU: x86_64
+        DefaultValueInitialized: true
+        OS: Windows
+  userData:
+  assetBundleName:
+  assetBundleVariant:
 "@
-$dxcMeta = @"
-fileFormatVersion: 2
-guid: d5c8b50147a04b219f30000000000102
-DefaultImporter:
-  externalObjects: {}
-  userData: 
-  assetBundleName: 
-  assetBundleVariant: 
-"@
-[System.IO.File]::WriteAllText("$dstProxyBin.meta", $proxyMeta, $utf8NoBom)
-[System.IO.File]::WriteAllText("$dstDxcBin.meta", $dxcMeta, $utf8NoBom)
+[System.IO.File]::WriteAllText("$dstUnityHookDll.meta", $unityHookMeta, $utf8NoBom)
 
 $zipName = "$pkgName-$effectiveVersion.zip"
 $zipPath = Join-Path $OutDir $zipName

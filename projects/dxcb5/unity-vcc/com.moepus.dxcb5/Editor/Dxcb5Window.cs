@@ -1,3 +1,4 @@
+// Distributed under the University of Illinois Open Source License.
 using UnityEditor;
 using UnityEngine;
 
@@ -5,9 +6,9 @@ namespace MoePus.Dxcb5.Editor
 {
     public sealed class Dxcb5Window : EditorWindow
     {
-        private Dxcb5Config _config;
-        private Dxcb5StatsSummary _stats;
-        private Vector2 _fallbackScroll;
+#if UNITY_EDITOR_WIN
+        private Dxcb5HookBridge.HookStats _stats;
+#endif
         private string _lastFeedback;
         private MessageType _lastFeedbackType = MessageType.None;
 
@@ -15,43 +16,40 @@ namespace MoePus.Dxcb5.Editor
         public static void ShowWindow()
         {
             var win = GetWindow<Dxcb5Window>("DXCB5 Compiler");
-            win.minSize = new Vector2(460f, 420f);
+            win.minSize = new Vector2(460f, 360f);
             win.Refresh();
             win.Show();
         }
 
-        private void OnEnable()
-        {
-            Refresh();
-        }
-
-        private void OnFocus()
-        {
-            Refresh();
-        }
+        private void OnEnable() => Refresh();
+        private void OnFocus() => Refresh();
 
         private void Refresh()
         {
-            _config = Dxcb5Installer.LoadConfig();
-            _stats = Dxcb5Installer.LoadStats();
+#if UNITY_EDITOR_WIN
+            _stats = Dxcb5HookBridge.GetStats();
+#endif
             Repaint();
         }
 
         private void OnGUI()
         {
             EditorGUILayout.Space(6);
-            EditorGUILayout.LabelField("DXCB5 SM5.0 Shader Compiler (Unity D3D11 Proxy)", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("DXCB5 SM5.0 Shader Compiler", EditorStyles.boldLabel);
 
             string unityVer = Application.unityVersion;
             bool isRecommended = unityVer == "2022.3.22f1";
             EditorGUILayout.HelpBox(
-                $"Unity Editor: {unityVer} {(isRecommended ? "(VRChat recommended)" : "(2022.3.x compatible)")}\n" +
-                $"Tools Dir: {Dxcb5Installer.GetUnityToolsDir()}",
+                $"Unity Editor: {unityVer} {(isRecommended ? "(VRChat recommended)" : "(2022.3.x compatible)")}",
                 MessageType.Info);
 
-            DrawInstallSection();
+#if !UNITY_EDITOR_WIN
+            EditorGUILayout.HelpBox("DXCB5 requires Windows x64 Unity Editor.", MessageType.Error);
+            return;
+#else
+            DrawStatusSection();
             EditorGUILayout.Space(8);
-            DrawConfigSection();
+            DrawOptionsSection();
             EditorGUILayout.Space(8);
             DrawStatsSection();
 
@@ -60,110 +58,120 @@ namespace MoePus.Dxcb5.Editor
                 EditorGUILayout.Space(6);
                 EditorGUILayout.HelpBox(_lastFeedback, _lastFeedbackType);
             }
+#endif
         }
 
-        private void DrawInstallSection()
+#if UNITY_EDITOR_WIN
+        private void DrawStatusSection()
         {
-            EditorGUILayout.LabelField("Installation", EditorStyles.boldLabel);
-            Dxcb5InstallState state = Dxcb5Installer.GetInstallState();
-            bool hasPayloads = Dxcb5Installer.HasNativePayloads(out string missingDetail);
+            EditorGUILayout.LabelField("Status", EditorStyles.boldLabel);
+            bool installed = Dxcb5HookBridge.IsInstalled;
+            bool hasPayloads = Dxcb5HookBridge.HasNativePayloads(out string missingDetail);
 
-            switch (state)
+            if (installed)
             {
-                case Dxcb5InstallState.Installed:
-                    EditorGUILayout.HelpBox(
-                        "Status: INSTALLED (D3DCompiler_47.dll proxy active; original FXC backed up as D3DCompiler_47_fxc.dll).",
-                        MessageType.Info);
-                    break;
-                case Dxcb5InstallState.NotInstalled:
-                    EditorGUILayout.HelpBox(
-                        "Status: NOT INSTALLED (Unity is using stock FXC D3DCompiler_47.dll).",
-                        MessageType.Warning);
-                    break;
-                case Dxcb5InstallState.PartialOrCorrupt:
-                    EditorGUILayout.HelpBox(
-                        "Status: PARTIAL INSTALL DETECTED. Click 'Uninstall & Restore FXC' or reinstall.",
-                        MessageType.Error);
-                    break;
-                default:
-                    EditorGUILayout.HelpBox(
-                        "Status: Unsupported platform (Windows x64 Unity Editor required).",
-                        MessageType.Error);
-                    return;
+                string cacheNote = _stats.SnippetHookActive
+                    ? "In-process RAM variant cache active."
+                    : "Worker CgBatch plugin active (in-process RAM cache inactive).";
+                EditorGUILayout.HelpBox(
+                    $"Status: ACTIVE ({(Dxcb5HookBridge.Enabled ? "DXCB5 enabled" : "paused -> stock FXC")})\n{cacheNote}",
+                    MessageType.Info);
+            }
+            else
+            {
+                EditorGUILayout.HelpBox(
+                    "Status: NOT ACTIVE (Unity is using stock FXC).",
+                    MessageType.Warning);
             }
 
             if (!hasPayloads)
-            {
-                EditorGUILayout.HelpBox(missingDetail, MessageType.Warning);
-            }
+                EditorGUILayout.HelpBox(missingDetail, MessageType.Error);
 
             using (new EditorGUILayout.HorizontalScope())
             {
                 using (new EditorGUI.DisabledScope(!hasPayloads))
                 {
-                    string installLabel = state == Dxcb5InstallState.Installed
-                        ? "Reinstall / Update DXCB5 Proxy"
-                        : "Install DXCB5 Proxy";
-                    if (GUILayout.Button(installLabel, GUILayout.Height(28)))
+                    string btn = installed ? "Reinstall Hook" : "Activate DXCB5";
+                    if (GUILayout.Button(btn, GUILayout.Height(26)))
                     {
-                        if (Dxcb5Installer.InstallProxy(out string msg))
-                        {
-                            _lastFeedback = msg;
-                            _lastFeedbackType = MessageType.Info;
-                        }
-                        else
-                        {
-                            _lastFeedback = msg;
-                            _lastFeedbackType = MessageType.Error;
-                        }
+                        bool ok = Dxcb5HookBridge.TryInstall(Dxcb5HookBridge.SnippetCacheEnabled);
+                        _lastFeedback = ok ? "DXCB5 hook activated." : "Failed to activate DXCB5 hook (see Console).";
+                        _lastFeedbackType = ok ? MessageType.Info : MessageType.Error;
                         Refresh();
                     }
                 }
-
-                using (new EditorGUI.DisabledScope(state == Dxcb5InstallState.NotInstalled))
+                using (new EditorGUI.DisabledScope(!installed))
                 {
-                    if (GUILayout.Button("Uninstall & Restore FXC", GUILayout.Height(28)))
+                    if (GUILayout.Button("Reload Workers", GUILayout.Height(26)))
                     {
-                        if (Dxcb5Installer.UninstallProxy(out string msg))
-                        {
-                            _lastFeedback = msg;
-                            _lastFeedbackType = MessageType.Info;
-                        }
-                        else
-                        {
-                            _lastFeedback = msg;
-                            _lastFeedbackType = MessageType.Error;
-                        }
+                        Dxcb5HookBridge.ReloadWorkers();
+                        _lastFeedback = "Restarted UnityShaderCompiler workers and cleared RAM cache (updated dxcompiler.dll / plugin will load on next compile).";
+                        _lastFeedbackType = MessageType.Info;
+                        Refresh();
+                    }
+                    if (GUILayout.Button("Deactivate", GUILayout.Height(26)))
+                    {
+                        Dxcb5HookBridge.SafeUninstall();
+                        _lastFeedback = "DXCB5 hook deactivated (stock FXC restored for new compiles).";
+                        _lastFeedbackType = MessageType.Info;
                         Refresh();
                     }
                 }
             }
 
-            if (GUILayout.Button("Clear Project Library/ShaderCache"))
+            using (new EditorGUILayout.HorizontalScope())
             {
-                if (EditorUtility.DisplayDialog(
-                        "Clear ShaderCache",
-                        "Delete Library/ShaderCache in this project so shaders recompile using DXCB5?",
-                        "Clear", "Cancel"))
+                if (GUILayout.Button("Clear RAM Variant Cache"))
                 {
-                    bool ok = Dxcb5Installer.ClearProjectShaderCache(out string msg);
-                    _lastFeedback = msg;
-                    _lastFeedbackType = ok ? MessageType.Info : MessageType.Error;
+                    Dxcb5HookBridge.ClearCache();
+                    _lastFeedback = "Cleared in-process RAM variant cache.";
+                    _lastFeedbackType = MessageType.Info;
+                    Refresh();
+                }
+                if (GUILayout.Button("Clear Project Library/ShaderCache"))
+                {
+                    if (EditorUtility.DisplayDialog(
+                            "Clear ShaderCache",
+                            "Delete Library/ShaderCache in this project so shaders recompile using DXCB5?",
+                            "Clear", "Cancel"))
+                    {
+                        bool ok = Dxcb5HookBridge.ClearProjectShaderCache(out string msg);
+                        _lastFeedback = msg;
+                        _lastFeedbackType = ok ? MessageType.Info : MessageType.Error;
+                        Refresh();
+                    }
                 }
             }
         }
 
-        private void DrawConfigSection()
+        private void DrawOptionsSection()
         {
             EditorGUILayout.LabelField("Runtime Options (takes effect immediately)", EditorStyles.boldLabel);
-            EditorGUI.BeginChangeCheck();
-            _config.Enabled = EditorGUILayout.ToggleLeft("Enable DXCB5 for vs_5_0 / ps_5_0 (uncheck to route directly to FXC)", _config.Enabled);
-            _config.RequirePackage = EditorGUILayout.ToggleLeft("Project-scoped only (auto-revert to FXC if com.moepus.dxcb5 is removed from VCC)", _config.RequirePackage);
-            _config.NanSafe = EditorGUILayout.ToggleLeft("Strict NaN Semantics (--nan-safe, slightly larger bytecode)", _config.NanSafe);
-            _config.LogStats = EditorGUILayout.ToggleLeft("Record Compile Telemetry (stats.log)", _config.LogStats);
-            if (EditorGUI.EndChangeCheck())
+            bool enabled = EditorGUILayout.ToggleLeft(
+                "Enable DXCB5 for vs_5_0 / ps_5_0 (uncheck to route directly to FXC)",
+                Dxcb5HookBridge.Enabled);
+            if (enabled != Dxcb5HookBridge.Enabled)
             {
-                Dxcb5Installer.SaveConfig(_config);
+                Dxcb5HookBridge.Enabled = enabled;
+                Refresh();
+            }
+
+            bool nanSafe = EditorGUILayout.ToggleLeft(
+                "Strict NaN Semantics (--nan-safe, slightly larger bytecode)",
+                Dxcb5HookBridge.NanSafe);
+            if (nanSafe != Dxcb5HookBridge.NanSafe)
+            {
+                Dxcb5HookBridge.NanSafe = nanSafe;
+                Refresh();
+            }
+
+            bool ramCache = EditorGUILayout.ToggleLeft(
+                "In-Process RAM Variant Deduplication Cache (Unity 2022.3.22f1)",
+                Dxcb5HookBridge.SnippetCacheEnabled);
+            if (ramCache != Dxcb5HookBridge.SnippetCacheEnabled)
+            {
+                Dxcb5HookBridge.SnippetCacheEnabled = ramCache;
+                Refresh();
             }
         }
 
@@ -171,33 +179,17 @@ namespace MoePus.Dxcb5.Editor
         {
             using (new EditorGUILayout.HorizontalScope())
             {
-                EditorGUILayout.LabelField("Compile Telemetry", EditorStyles.boldLabel);
+                EditorGUILayout.LabelField("Session Statistics", EditorStyles.boldLabel);
                 GUILayout.FlexibleSpace();
                 if (GUILayout.Button("Refresh", GUILayout.Width(72)))
                     Refresh();
-                if (GUILayout.Button("Clear Log", GUILayout.Width(78)))
-                {
-                    Dxcb5Installer.ClearStatsLog();
-                    Refresh();
-                }
             }
 
-            int total = _stats.Hits + _stats.Fallbacks;
-            double rate = total > 0 ? (100.0 * _stats.Hits / total) : 0.0;
+            ulong total = _stats.RamCacheHits + _stats.IpcCompiles;
+            double hitRate = total > 0 ? (100.0 * _stats.RamCacheHits / total) : 0.0;
             EditorGUILayout.LabelField(
-                $"DXCB5 Hits: {_stats.Hits}   |   FXC Fallbacks: {_stats.Fallbacks}   |   Hit Rate: {rate:F1}%   |   Avg DXCB5: {_stats.AvgHitMs:F1} ms");
-
-            if (_stats.RecentFallbacks != null && _stats.RecentFallbacks.Count > 0)
-            {
-                EditorGUILayout.LabelField("Recent FXC Fallbacks:", EditorStyles.miniBoldLabel);
-                _fallbackScroll = EditorGUILayout.BeginScrollView(_fallbackScroll, GUILayout.MinHeight(90), GUILayout.MaxHeight(160));
-                for (int i = _stats.RecentFallbacks.Count - 1; i >= 0; --i)
-                {
-                    var fb = _stats.RecentFallbacks[i];
-                    EditorGUILayout.LabelField($"[{fb.Target} {fb.Entrypoint}] {fb.Reason}", EditorStyles.wordWrappedMiniLabel);
-                }
-                EditorGUILayout.EndScrollView();
-            }
+                $"Workers Hooked: {_stats.WorkersHooked}   |   RAM Hits: {_stats.RamCacheHits}   |   IPC Compiles: {_stats.IpcCompiles}   |   RAM Hit Rate: {hitRate:F1}%");
         }
+#endif
     }
 }
