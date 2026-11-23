@@ -18,6 +18,14 @@ bool SameSlot(const Operand &A, const Operand &B) {
          A.Index == B.Index && (A.Mask & B.Mask) != 0;
 }
 
+bool Allocate(std::vector<FlowBlock> &Blocks, uint32_t TempCount,
+              MirProgram &Program, std::string *OutError = nullptr) {
+  Program.TempCount = TempCount;
+  std::string LocalErr;
+  std::string &Err = OutError ? *OutError : LocalErr;
+  return AllocateRegisters(Blocks, Program, Err);
+}
+
 bool CheckStraightLineReuse() {
   std::vector<FlowBlock> Blocks(1);
   Blocks[0].Instructions = {
@@ -26,9 +34,7 @@ bool CheckStraightLineReuse() {
       Mov({OperandKind::Temp, 12}, {OperandKind::Immediate, 22}),
       Mov({OperandKind::Output, 1}, {OperandKind::Temp, 12})};
   MirProgram Program;
-  Program.TempCount = 17;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 17, Program))
     return false;
   const auto &Code = Blocks[0].Instructions;
   return Program.TempCount == 1 && Code[0].Operands[0].Index == 0 &&
@@ -57,9 +63,7 @@ bool CheckLiveAcrossBackEdge() {
   Blocks[2].Edges = {{1, {}}};
 
   MirProgram Program;
-  Program.TempCount = 10;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 10, Program))
     return false;
   const Operand PersistentY = Blocks[0].Instructions[0].Operands[0];
   const Operand PersistentX = Blocks[2].Instructions[2].Operands[0];
@@ -99,9 +103,7 @@ bool CheckLiveThroughReorderedBlocks() {
       Mov({OperandKind::Output, 1}, ReadOtherY)};
 
   MirProgram Program;
-  Program.TempCount = 9;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 9, Program))
     return false;
   const Operand Live = Blocks[3].Instructions[0].Operands[0];
   const Operand Other = Blocks[3].Instructions[1].Operands[0];
@@ -143,8 +145,17 @@ bool CheckParallelDestinations() {
       (1u << (Use0.Swizzle & 3u)) != Def0.Mask ||
       (1u << (Use1.Swizzle & 3u)) != Def1.Mask)
     return false;
-  return LowerControlFlow(Blocks, Program, Error) && Program.TempCount == 1 &&
-         Program.Instructions.size() == 5;
+  if (!LowerControlFlow(Blocks, Program, Error) ||
+      Program.Instructions.size() != 3)
+    return false;
+  return Program.Instructions[0].Opcode == D3D10_SB_OPCODE_MOV &&
+         Program.Instructions[0].Operands[0].Kind == OperandKind::Output &&
+         Program.Instructions[0].Operands[1].Kind == OperandKind::Immediate &&
+         Program.Instructions[0].Operands[1].Index == 11 &&
+         Program.Instructions[1].Opcode == D3D10_SB_OPCODE_MOV &&
+         Program.Instructions[1].Operands[0].Kind == OperandKind::Output &&
+         Program.Instructions[1].Operands[1].Kind == OperandKind::Immediate &&
+         Program.Instructions[1].Operands[1].Index == 22;
 }
 
 bool CheckSourceLiveOnSiblingEdge() {
@@ -160,9 +171,7 @@ bool CheckSourceLiveOnSiblingEdge() {
       Mov({OperandKind::Output, 0}, {OperandKind::Temp, 4})};
 
   MirProgram Program;
-  Program.TempCount = 8;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 8, Program))
     return false;
 
   // Coalescing eliminates the edge copy completely into 1 temp.
@@ -181,18 +190,22 @@ bool CheckImmediateEdgeCopy() {
       Mov({OperandKind::Output, 0}, {OperandKind::Temp, 7})};
 
   MirProgram Program;
-  Program.TempCount = 8;
   std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error) || Program.TempCount != 1 ||
-      !LowerControlFlow(Blocks, Program, Error) || Program.Instructions.size() != 3)
+  if (!Allocate(Blocks, 8, Program, &Error) || Program.TempCount != 1 ||
+      Blocks[0].Edges[0].Copies.size() != 1 ||
+      Blocks[0].Edges[0].Copies[0].Destination != 0 ||
+      Blocks[0].Edges[0].Copies[0].Source.Kind != OperandKind::Immediate ||
+      Blocks[0].Edges[0].Copies[0].Source.Index != UINT32_MAX ||
+      !LowerControlFlow(Blocks, Program, Error) ||
+      Program.Instructions.size() != 2)
     return false;
 
-  const Instruction &Copy = Program.Instructions[0];
-  return Copy.Opcode == D3D10_SB_OPCODE_MOV &&
-         Copy.Operands[0].Kind == OperandKind::Temp &&
-         Copy.Operands[0].Index == 0 &&
-         Copy.Operands[1].Kind == OperandKind::Immediate &&
-         Copy.Operands[1].Index == UINT32_MAX;
+  const Instruction &Out = Program.Instructions[0];
+  return Out.Opcode == D3D10_SB_OPCODE_MOV &&
+         Out.Operands[0].Kind == OperandKind::Output &&
+         Out.Operands[0].Index == 0 &&
+         Out.Operands[1].Kind == OperandKind::Immediate &&
+         Out.Operands[1].Index == UINT32_MAX;
 }
 
 bool CheckSubRegScalarPacking4To1() {
@@ -208,11 +221,7 @@ bool CheckSubRegScalarPacking4To1() {
       Mov({OperandKind::Output, 2}, {OperandKind::Temp, 2}),
       Mov({OperandKind::Output, 3}, {OperandKind::Temp, 3})};
   MirProgram Program;
-  Program.TempCount = 4;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
-    return false;
-  if (Program.TempCount != 1)
+  if (!Allocate(Blocks, 4, Program) || Program.TempCount != 1)
     return false;
   uint8_t AllMasks = 0;
   for (unsigned I = 0; I < 4; ++I) {
@@ -239,11 +248,7 @@ bool CheckVec3PlusScalarPacking() {
       Mov(Out3, V3),
       Mov({OperandKind::Output, 1}, S1)};
   MirProgram Program;
-  Program.TempCount = 2;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
-    return false;
-  if (Program.TempCount != 1)
+  if (!Allocate(Blocks, 2, Program) || Program.TempCount != 1)
     return false;
   const Operand &DefV3 = Blocks[0].Instructions[0].Operands[0];
   const Operand &DefS1 = Blocks[0].Instructions[1].Operands[0];
@@ -264,9 +269,7 @@ bool CheckCrossLanePhiCoalescing() {
   Blocks[1].Instructions = {
       Mov({OperandKind::Output, 0}, {OperandKind::Temp, 1})};
   MirProgram Program;
-  Program.TempCount = 2;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 2, Program))
     return false;
   return Program.TempCount == 1 && Blocks[0].Edges[0].Copies.empty() &&
          Blocks[0].Instructions[0].Operands[0].Index ==
@@ -284,16 +287,40 @@ bool CheckIntraBlockMovCoalescing() {
       Mov({OperandKind::Temp, 1}, {OperandKind::Temp, 0}),
       Mov({OperandKind::Output, 0}, {OperandKind::Temp, 1})};
   MirProgram Program;
-  Program.TempCount = 2;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 2, Program))
     return false;
   return Program.TempCount == 1 && Blocks[0].Instructions.size() == 2;
 }
 
 bool CheckFixedLaneTextureDest() {
-  // SAMPLE dest writes .yz (mask 0x6) and must keep fixed lanes .yz; a live
-  // scalar packs into .x or .w of the same physical register.
+  // GATHER4 dest writes .yz (mask 0x6) and cannot permute return channels via
+  // resource swizzle, so it must keep fixed lanes .yz; a live scalar packs
+  // into .x or .w of the same physical register.
+  std::vector<FlowBlock> Blocks(1);
+  Operand TexDst{OperandKind::Temp, 0, 0, 0x6u, 0x55u};
+  Operand Scalar{OperandKind::Temp, 1, 0, 0x1u, 0x00u};
+  Blocks[0].Instructions = {
+      {D3D10_1_SB_OPCODE_GATHER4,
+       {TexDst, {OperandKind::Input, 0, 0, 0x3u, 0x04u},
+        {OperandKind::Resource, 0, 0, 0xfu, 0xe4u},
+        {OperandKind::Sampler, 0, 0, 0, 0}}},
+      Mov(Scalar, {OperandKind::Input, 1}),
+      Mov({OperandKind::Output, 0, 0, 0x6u, 0xe4u},
+          {OperandKind::Temp, 0, 0, 0x6u, 0xe4u}),
+      Mov({OperandKind::Output, 1}, Scalar)};
+  MirProgram Program;
+  if (!Allocate(Blocks, 2, Program))
+    return false;
+  const Operand &DefTex = Blocks[0].Instructions[0].Operands[0];
+  const Operand &DefS = Blocks[0].Instructions[1].Operands[0];
+  return Program.TempCount == 1 && DefTex.Mask == 0x6u &&
+         (DefS.Mask & 0x6u) == 0;
+}
+
+bool CheckRemappableSampleReturnSwizzle() {
+  // SAMPLE dest writes .yz (mask 0x6); RegAlloc may remap its destination lanes
+  // as long as the resource return swizzle and consumer swizzle stay consistent
+  // and a live scalar packs into the same physical register.
   std::vector<FlowBlock> Blocks(1);
   Operand TexDst{OperandKind::Temp, 0, 0, 0x6u, 0x55u};
   Operand Scalar{OperandKind::Temp, 1, 0, 0x1u, 0x00u};
@@ -307,14 +334,19 @@ bool CheckFixedLaneTextureDest() {
           {OperandKind::Temp, 0, 0, 0x6u, 0xe4u}),
       Mov({OperandKind::Output, 1}, Scalar)};
   MirProgram Program;
-  Program.TempCount = 2;
-  std::string Error;
-  if (!AllocateRegisters(Blocks, Program, Error))
+  if (!Allocate(Blocks, 2, Program))
     return false;
   const Operand &DefTex = Blocks[0].Instructions[0].Operands[0];
+  const Operand &Res = Blocks[0].Instructions[0].Operands[2];
   const Operand &DefS = Blocks[0].Instructions[1].Operands[0];
-  return Program.TempCount == 1 && DefTex.Mask == 0x6u &&
-         (DefS.Mask & 0x6u) == 0;
+  const Operand &UseTex = Blocks[0].Instructions[2].Operands[1];
+  const unsigned PhysForY = (UseTex.Swizzle >> 2) & 3u;
+  const unsigned PhysForZ = (UseTex.Swizzle >> 4) & 3u;
+  return Program.TempCount == 1 && (DefTex.Mask & DefS.Mask) == 0 &&
+         (DefTex.Mask & (1u << PhysForY)) != 0 &&
+         (DefTex.Mask & (1u << PhysForZ)) != 0 &&
+         ((Res.Swizzle >> (2 * PhysForY)) & 3u) == 1u &&
+         ((Res.Swizzle >> (2 * PhysForZ)) & 3u) == 2u;
 }
 
 bool CheckInvalidRelativeRegister() {
@@ -323,9 +355,8 @@ bool CheckInvalidRelativeRegister() {
   Indirect.RelativeRegister = 5;
   Blocks[0].Instructions = {Mov({OperandKind::Temp, 3}, Indirect)};
   MirProgram Program;
-  Program.TempCount = 4;
   std::string Error;
-  return !AllocateRegisters(Blocks, Program, Error) && !Error.empty() &&
+  return !Allocate(Blocks, 4, Program, &Error) && !Error.empty() &&
          Program.TempCount == 4 &&
          Blocks[0].Instructions[0].Operands[0].Index == 3;
 }
@@ -376,17 +407,83 @@ bool CheckSparseInterferenceGraph() {
          Neighbors[2] == E;
 }
 
+bool CheckVerifyAllocationRejectsFaults() {
+  // v0.xy and v1.x are simultaneously live across the second MOV.
+  std::vector<FlowBlock> Blocks(1);
+  Blocks[0].Instructions = {
+      Mov({OperandKind::Temp, 0, 0, 0x3u}, {OperandKind::Immediate, 1}),
+      Mov({OperandKind::Temp, 1, 0, 0x1u}, {OperandKind::Immediate, 2}),
+      Mov({OperandKind::Output, 0, 0, 0x3u}, {OperandKind::Temp, 0, 0, 0x3u, 0xe4u}),
+      Mov({OperandKind::Output, 1, 0, 0x1u}, {OperandKind::Temp, 1, 0, 0x1u, 0x00u}),
+  };
+  LivenessResult Live;
+  if (!ComputeLiveness(Blocks, 2, Live))
+    return false;
+  std::string Err;
+  // Valid non-overlapping sub-register packing: v0 -> r0.xy, v1 -> r0.z.
+  std::vector<LaneAllocation> Good(2);
+  Good[0] = {0, {0, 1, 2, 3}, 0x3u};
+  Good[1] = {0, {2, 1, 2, 3}, 0x4u};
+  if (!VerifyAllocation(Blocks, Live, Good, 1, Err))
+    return false;
+
+  // Fault 1: overlapping live physical slot (v1.x mapped to r0.y colliding with v0.y).
+  auto Overlap = Good;
+  Overlap[1] = {0, {1, 1, 2, 3}, 0x2u};
+  if (VerifyAllocation(Blocks, Live, Overlap, 1, Err))
+    return false;
+
+  // Fault 2: non-injective LaneMap on multi-lane v0 (both x and y -> lane 0).
+  auto NonInj = Good;
+  NonInj[0] = {0, {0, 0, 2, 3}, 0x1u};
+  if (VerifyAllocation(Blocks, Live, NonInj, 1, Err))
+    return false;
+
+  // Fault 3: out-of-bounds physical register.
+  auto Oob = Good;
+  Oob[1].PhysReg = 1;
+  if (VerifyAllocation(Blocks, Live, Oob, 1, Err))
+    return false;
+
+  // Fault 4: violated FixedLanes constraint.
+  Live.Temps[0].FixedLanes = true;
+  auto BadFixed = Good;
+  BadFixed[0] = {0, {1, 0, 2, 3}, 0x3u};
+  if (VerifyAllocation(Blocks, Live, BadFixed, 1, Err))
+    return false;
+
+  return true;
+}
+
 } // namespace
 
 int main() {
-  if (!CheckStraightLineReuse() || !CheckLiveAcrossBackEdge() ||
-      !CheckLiveThroughReorderedBlocks() || !CheckParallelDestinations() ||
-      !CheckSourceLiveOnSiblingEdge() || !CheckImmediateEdgeCopy() ||
-      !CheckSubRegScalarPacking4To1() || !CheckVec3PlusScalarPacking() ||
-      !CheckCrossLanePhiCoalescing() || !CheckIntraBlockMovCoalescing() ||
-      !CheckFixedLaneTextureDest() || !CheckInvalidRelativeRegister() ||
-      !CheckSparseInterferenceGraph()) {
-    std::cerr << "MIR register allocation violated a live range or packing invariant\n";
-    return 1;
+  struct TestCase {
+    const char *Name;
+    bool (*Fn)();
+  };
+  const TestCase Cases[] = {
+      {"CheckStraightLineReuse", CheckStraightLineReuse},
+      {"CheckLiveAcrossBackEdge", CheckLiveAcrossBackEdge},
+      {"CheckLiveThroughReorderedBlocks", CheckLiveThroughReorderedBlocks},
+      {"CheckParallelDestinations", CheckParallelDestinations},
+      {"CheckSourceLiveOnSiblingEdge", CheckSourceLiveOnSiblingEdge},
+      {"CheckImmediateEdgeCopy", CheckImmediateEdgeCopy},
+      {"CheckSubRegScalarPacking4To1", CheckSubRegScalarPacking4To1},
+      {"CheckVec3PlusScalarPacking", CheckVec3PlusScalarPacking},
+      {"CheckCrossLanePhiCoalescing", CheckCrossLanePhiCoalescing},
+      {"CheckIntraBlockMovCoalescing", CheckIntraBlockMovCoalescing},
+      {"CheckFixedLaneTextureDest", CheckFixedLaneTextureDest},
+      {"CheckRemappableSampleReturnSwizzle", CheckRemappableSampleReturnSwizzle},
+      {"CheckInvalidRelativeRegister", CheckInvalidRelativeRegister},
+      {"CheckSparseInterferenceGraph", CheckSparseInterferenceGraph},
+      {"CheckVerifyAllocationRejectsFaults", CheckVerifyAllocationRejectsFaults},
+  };
+  for (const TestCase &Case : Cases) {
+    if (!Case.Fn()) {
+      std::cerr << "MIR register allocation violated invariant in " << Case.Name
+                << "\n";
+      return 1;
+    }
   }
 }

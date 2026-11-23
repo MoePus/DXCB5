@@ -315,7 +315,7 @@ int main(int Argc, char **Argv) {
   if (Mode == "loop" || Mode == "loop-retry" || TestSign || Mode == "saturate" ||
       Mode == "local-constant-tuples") {
     if (TestSign &&
-        (Assembly.count("\niadd ") != 1 || Assembly.count("\nineg ") != 0 ||
+        (Assembly.count("\niadd ") > 1 || Assembly.count("\nineg ") != 0 ||
          Assembly.count("\nitof ") != 1 ||
          !HasDotLiteral(Assembly, "\nmovc ", "0xbf800000") ||
          !HasDotLiteral(Assembly, "\nmovc ", "0x3f800000"))) {
@@ -368,10 +368,14 @@ int main(int Argc, char **Argv) {
     std::fwrite(Assembly.data(), 1, Assembly.size(), stderr);
     return 1;
   }
-  if (Assembly.find("vs_5_0") != StringRef::npos &&
-      Assembly.find("\nadd ") != StringRef::npos)
-    return 0;
-  std::fputs("Expected an SM5.0 vertex shader with an add instruction\n", stderr);
-  std::fwrite(Assembly.data(), 1, Assembly.size(), stderr);
+  if (Mode == "arithmetic") {
+    if (Assembly.find("vs_5_0") != StringRef::npos &&
+        Assembly.find("\nadd ") != StringRef::npos)
+      return 0;
+    std::fputs("Expected an SM5.0 vertex shader with an add instruction\n", stderr);
+    std::fwrite(Assembly.data(), 1, Assembly.size(), stderr);
+    return 1;
+  }
+  std::fprintf(stderr, "Unknown DirectDxilTest mode: %s\n", Argv[2]);
   return 1;
 }

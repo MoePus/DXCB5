@@ -30,61 +30,35 @@ run_checked("${DXCB5}" "${source}" -E PS -T ps_5_0 -Fo "${discard_ps}"
   -D DXCB5_TEST_DISCARD=1 --vs-dxbc "${native_vs}")
 run_checked("${WARP_TEST}" draw-discard "${native_vs}" "${discard_ps}")
 
-set(resources_ps "${TEST_DIR}/resource-arrays.ps")
-set(resources_baseline_ps "${TEST_DIR}/resource-arrays-baseline.ps")
-run_checked("${WARP_TEST}" compile-resource-arrays "${source}" "${resources_baseline_ps}")
-run_checked("${WARP_TEST}" draw-resource-arrays "${baseline_vs}" "${resources_baseline_ps}")
-run_checked("${DXCB5}" "${source}" -E PSResources -T ps_5_0
-  -Fo "${resources_ps}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-resource-arrays "${native_vs}" "${resources_ps}")
+function(run_ps_parity slug entry)
+  set(base_ps "${TEST_DIR}/${slug}-fxc.ps")
+  set(nat_ps "${TEST_DIR}/${slug}-dxcb5.ps")
+  run_checked("${WARP_TEST}" "compile-${slug}" "${source}" "${base_ps}")
+  run_checked("${DXCB5}" "${source}" -E "${entry}" -T ps_5_0 ${ARGN}
+    -Fo "${nat_ps}" --vs-dxbc "${native_vs}")
+  run_checked("${WARP_TEST}" "draw-${slug}" "${baseline_vs}" "${base_ps}")
+  run_checked("${WARP_TEST}" "draw-${slug}" "${native_vs}" "${nat_ps}")
+endfunction()
 
-set(quad_loop_baseline "${TEST_DIR}/quad-loop-fxc.ps")
-set(quad_loop_native "${TEST_DIR}/quad-loop-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-quad-loop "${source}" "${quad_loop_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSQuadLoop -T ps_5_0
-  -Fo "${quad_loop_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-quad-loop "${baseline_vs}" "${quad_loop_baseline}")
-run_checked("${WARP_TEST}" draw-quad-loop "${native_vs}" "${quad_loop_native}")
+function(run_direct_draw slug ll_file direct_mode draw_mode)
+  set(out_dxbc "${TEST_DIR}/${slug}.dxbc")
+  run_checked("${DIRECT_TEST}" "${CMAKE_CURRENT_LIST_DIR}/${ll_file}"
+    "${direct_mode}" "${out_dxbc}" "${native_vs}")
+  run_checked("${WARP_TEST}" "${draw_mode}" "${native_vs}" "${out_dxbc}")
+endfunction()
 
-set(loop_lanes "${TEST_DIR}/loop-lanes.dxbc")
-run_checked("${DIRECT_TEST}" "${CMAKE_CURRENT_LIST_DIR}/DirectLoopLanes.ll"
-  loop "${loop_lanes}" "${native_vs}")
-run_checked("${WARP_TEST}" draw-loop-lanes "${native_vs}" "${loop_lanes}")
-set(retry_loop "${TEST_DIR}/retry-loop.dxbc")
-run_checked("${DIRECT_TEST}" "${CMAKE_CURRENT_LIST_DIR}/DirectRetryLoop.ll"
-  loop-retry "${retry_loop}" "${native_vs}")
-run_checked("${WARP_TEST}" draw-retry-loop "${native_vs}" "${retry_loop}")
+run_ps_parity(resource-arrays PSResources)
+run_ps_parity(quad-loop PSQuadLoop)
 
-set(sign_shader "${TEST_DIR}/sign.dxbc")
-run_checked("${DIRECT_TEST}" "${CMAKE_CURRENT_LIST_DIR}/DirectSign.ll"
-  sign "${sign_shader}" "${native_vs}")
-run_checked("${WARP_TEST}" draw-sign "${native_vs}" "${sign_shader}")
+run_direct_draw(loop-lanes DirectLoopLanes.ll loop draw-loop-lanes)
+run_direct_draw(retry-loop DirectRetryLoop.ll loop-retry draw-retry-loop)
+run_direct_draw(sign DirectSign.ll sign draw-sign)
+run_direct_draw(saturate DirectSaturate.ll saturate draw-saturate)
+run_direct_draw(local-constant-tuples DirectLocalConstantTuples.ll
+  local-constant-tuples draw-local-constant-tuples)
 
-set(saturate_shader "${TEST_DIR}/saturate.dxbc")
-run_checked("${DIRECT_TEST}" "${CMAKE_CURRENT_LIST_DIR}/DirectSaturate.ll"
-  saturate "${saturate_shader}" "${native_vs}")
-run_checked("${WARP_TEST}" draw-saturate "${native_vs}" "${saturate_shader}")
-
-set(local_constant_tuples "${TEST_DIR}/local-constant-tuples.dxbc")
-run_checked("${DIRECT_TEST}" "${CMAKE_CURRENT_LIST_DIR}/DirectLocalConstantTuples.ll"
-  local-constant-tuples "${local_constant_tuples}" "${native_vs}")
-run_checked("${WARP_TEST}" draw-local-constant-tuples "${native_vs}" "${local_constant_tuples}")
-
-set(local_arrays_baseline "${TEST_DIR}/local-arrays-fxc.ps")
-set(local_arrays_native "${TEST_DIR}/local-arrays-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-local-arrays "${source}" "${local_arrays_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSLocalArrays -T ps_5_0 -O3
-  -Fo "${local_arrays_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-local-arrays "${baseline_vs}" "${local_arrays_baseline}")
-run_checked("${WARP_TEST}" draw-local-arrays "${native_vs}" "${local_arrays_native}")
-
-set(gather_baseline "${TEST_DIR}/gather-fxc.ps")
-set(gather_native "${TEST_DIR}/gather-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-gather "${source}" "${gather_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSGather -T ps_5_0
-  -Fo "${gather_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-gather "${baseline_vs}" "${gather_baseline}")
-run_checked("${WARP_TEST}" draw-gather "${native_vs}" "${gather_native}")
+run_ps_parity(local-arrays PSLocalArrays -O3)
+run_ps_parity(gather PSGather)
 
 set(correctness_baseline "${TEST_DIR}/correctness-fxc.ps")
 set(correctness_o3 "${TEST_DIR}/correctness-dxcb5-o3.ps")
@@ -98,45 +72,11 @@ run_checked("${WARP_TEST}" draw-correctness "${baseline_vs}" "${correctness_base
 run_checked("${WARP_TEST}" draw-correctness "${native_vs}" "${correctness_o3}")
 run_checked("${WARP_TEST}" draw-correctness "${native_vs}" "${correctness_od}")
 
-set(dimensions_baseline "${TEST_DIR}/dimensions-fxc.ps")
-set(dimensions_native "${TEST_DIR}/dimensions-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-dimensions "${source}" "${dimensions_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSDimensions -T ps_5_0
-  -Fo "${dimensions_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-dimensions "${baseline_vs}" "${dimensions_baseline}")
-run_checked("${WARP_TEST}" draw-dimensions "${native_vs}" "${dimensions_native}")
-
-set(compat_baseline "${TEST_DIR}/compat-fxc.ps")
-set(compat_native "${TEST_DIR}/compat-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-compat "${source}" "${compat_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSCompat -T ps_5_0 -O3
-  -Fo "${compat_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-compat "${baseline_vs}" "${compat_baseline}")
-run_checked("${WARP_TEST}" draw-compat "${native_vs}" "${compat_native}")
-
-set(compat2_baseline "${TEST_DIR}/compat2-fxc.ps")
-set(compat2_native "${TEST_DIR}/compat2-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-compat2 "${source}" "${compat2_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSCompat2 -T ps_5_0 -O3
-  -Fo "${compat2_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-compat2 "${baseline_vs}" "${compat2_baseline}")
-run_checked("${WARP_TEST}" draw-compat2 "${native_vs}" "${compat2_native}")
-
-set(compat3_baseline "${TEST_DIR}/compat3-fxc.ps")
-set(compat3_native "${TEST_DIR}/compat3-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-compat3 "${source}" "${compat3_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSCompat3 -T ps_5_0 -O3
-  -Fo "${compat3_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-compat3 "${baseline_vs}" "${compat3_baseline}")
-run_checked("${WARP_TEST}" draw-compat3 "${native_vs}" "${compat3_native}")
-
-set(compat4_baseline "${TEST_DIR}/compat4-fxc.ps")
-set(compat4_native "${TEST_DIR}/compat4-dxcb5.ps")
-run_checked("${WARP_TEST}" compile-compat4 "${source}" "${compat4_baseline}")
-run_checked("${DXCB5}" "${source}" -E PSCompat4 -T ps_5_0 -O3
-  -Fo "${compat4_native}" --vs-dxbc "${native_vs}")
-run_checked("${WARP_TEST}" draw-compat4 "${baseline_vs}" "${compat4_baseline}")
-run_checked("${WARP_TEST}" draw-compat4 "${native_vs}" "${compat4_native}")
+run_ps_parity(dimensions PSDimensions)
+run_ps_parity(compat PSCompat -O3)
+run_ps_parity(compat2 PSCompat2 -O3)
+run_ps_parity(compat3 PSCompat3 -O3)
+run_ps_parity(compat4 PSCompat4 -O3)
 
 function(expect_array_error define diagnostic)
   set(output "${TEST_DIR}/${define}.ps")
@@ -151,3 +91,26 @@ endfunction()
 expect_array_error(DXCB5_TEST_DYNAMIC_SRV "constant binding index")
 expect_array_error(DXCB5_TEST_DYNAMIC_SAMPLER "constant binding index")
 expect_array_error(DXCB5_TEST_OVERFLOW_RANGE "finite binding range")
+
+# Step 4 Pass Ablation Gate: individually disable each major optimization pass
+# and verify WARP pixel output remains 100% consistent (no hidden pass coupling).
+function(run_ablation entry draw_mode extra_flags pass_name)
+  set(abl_ps "${TEST_DIR}/ablate-${entry}-${pass_name}.ps")
+  execute_process(
+    COMMAND "${DXCB5}" "${source}" -E "${entry}" -T ps_5_0 -O3 ${extra_flags}
+      --disable-pass "${pass_name}"
+      -Fo "${abl_ps}" --vs-dxbc "${native_vs}"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(NOT result STREQUAL "0")
+    message(FATAL_ERROR "Pass ablation (${entry}, disable=${pass_name}) compile failed (${result})\n${output}${error}")
+  endif()
+  run_checked("${WARP_TEST}" "${draw_mode}" "${native_vs}" "${abl_ps}")
+endfunction()
+
+foreach(pass copies lane-const if-convert gvn masked-dce dots algebraic slp dp2 loop-peel guard-discard licm cold-sink fold-outputs pressure-shrink)
+  run_ablation(PSCorrectness draw-correctness "--nan-safe" "${pass}")
+endforeach()
+
+foreach(pass indexable-copy indexable-ssa indexable-temps indexable-pack)
+  run_ablation(PSLocalArrays draw-local-arrays "" "${pass}")
+endforeach()

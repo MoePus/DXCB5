@@ -1,5 +1,6 @@
 // Distributed under the University of Illinois Open Source License.
 #include "dxcb5/ControlFlow.h"
+#include "dxcb5/DxbcWriter.h"
 #include "dxcb5/RegisterAllocation.h"
 
 #include "dxc/Support/d3d12TokenizedProgramFormat.hpp"
@@ -148,18 +149,19 @@ bool CheckCriticalEdgeCopies() {
     return false;
 
   const auto &Code = Program.Instructions;
-  const auto Find = [&](uint32_t Opcode) {
-    return std::find_if(Code.begin(), Code.end(), [&](const Instruction &Inst) {
-      return Inst.Opcode == Opcode;
-    });
-  };
-  const auto If = Find(D3D10_SB_OPCODE_IF);
-  const auto Else = Find(D3D10_SB_OPCODE_ELSE);
-  const auto End = Find(D3D10_SB_OPCODE_ENDIF);
-  return If < Else && Else < End && End != Code.end() &&
-         Else - If == 4 && End - Else == 2 &&
-         CheckSymbolicCopies(If + 1, Else, Blocks[0].Edges[0], FirstScratch) &&
-         CheckSymbolicCopies(Else + 1, End, Blocks[1].Edges[0], FirstScratch);
+  // The intra-register swap r0.y <-> r0.z folds into 1 atomic self-swizzle
+  // with zero scratch temp, allowing SimplifyIfWithElse to hoist it before
+  // `if_z v0.x { mov r0.yz, r2.wyxx } endif; ret`.
+  return Program.TempCount == FirstScratch && Code.size() == 5 &&
+         Code[0].Opcode == D3D10_SB_OPCODE_MOV &&
+         Code[1].Opcode == D3D10_SB_OPCODE_IF && !Code[1].TestNonZero &&
+         Code[2].Opcode == D3D10_SB_OPCODE_MOV &&
+         Code[3].Opcode == D3D10_SB_OPCODE_ENDIF &&
+         Code[4].Opcode == D3D10_SB_OPCODE_RET &&
+         CheckSymbolicCopies(Code.begin(), Code.begin() + 1,
+                             Blocks[0].Edges[0], FirstScratch) &&
+         CheckSymbolicCopies(Code.begin() + 2, Code.begin() + 3,
+                             Blocks[1].Edges[0], FirstScratch);
 }
 
 enum class Exit { End, Break, Continue, Return, Invalid };
@@ -541,7 +543,7 @@ bool CheckBranchedLoop() {
   };
   if (CountOpcode(D3D10_SB_OPCODE_LOOP) != 1 ||
       (CountOpcode(D3D10_SB_OPCODE_BREAK) + CountOpcode(D3D10_SB_OPCODE_BREAKC)) != 1 ||
-      CountOpcode(D3D10_SB_OPCODE_SWITCH) != 0 || Program.TempCount != 5)
+      CountOpcode(D3D10_SB_OPCODE_SWITCH) != 0 || Program.TempCount != 4)
     return false;
   TraceExecution WithArm(Program, 1), WithoutArm(Program, 0);
   return WithArm.Run() && WithoutArm.Run() &&
@@ -1417,55 +1419,246 @@ bool CheckNestedArmHoistAndElseDominatingDrop() {
          T00.Run() && T00.Output == std::vector<uint32_t>{15, 16};
 }
 
+bool CheckMovFoldDoesNotCrossIndexableWrite() {
+  // mov r1.x, x0[0].x; mov x0[0].x, l(99); if_nz r0.x; mov r1.x, l(10); endif
+  // Must NOT fold x0[0].x into movc after x0[0].x was overwritten with 99!
+  enum BlockID { Entry, Then, Join, BlockCount };
+  std::vector<FlowBlock> Blocks(BlockCount);
+  const Operand X0{OperandKind::IndexableTemp, 0, 0, 1, 0};
+  Blocks[Entry].Kind = FlowKind::Branch;
+  Blocks[Entry].Condition = Register(0);
+  Blocks[Entry].Edges = {{Then, {}}, {Join, {}}};
+  Blocks[Entry].Instructions = {
+      {D3D10_SB_OPCODE_MOV, {X0, Operand{OperandKind::Immediate, 7}}},
+      {D3D10_SB_OPCODE_MOV, {Register(1), X0}},
+      {D3D10_SB_OPCODE_MOV, {X0, Operand{OperandKind::Immediate, 99}}}};
+  Blocks[Then].Kind = FlowKind::Jump;
+  Blocks[Then].Edges = {{Join, {}}};
+  Blocks[Then].Instructions = {
+      {D3D10_SB_OPCODE_MOV, {Register(1), Operand{OperandKind::Immediate, 10}}}};
+  Blocks[Join].Kind = FlowKind::Return;
+  Blocks[Join].Instructions = {Observe(Register(1))};
+
+  MirProgram Program;
+  Program.TempCount = 2;
+  Program.IndexableTemps.push_back({0, 1, 1});
+  std::string Error;
+  if (!LowerControlFlow(Blocks, Program, Error)) {
+    std::cerr << Error << '\n';
+    return false;
+  }
+  for (const auto &I : Program.Instructions) {
+    if (I.Opcode == D3D10_SB_OPCODE_MOVC) {
+      for (size_t K = 1; K < I.Operands.size(); ++K) {
+        if (I.Operands[K].Kind == OperandKind::IndexableTemp) {
+          std::cerr << "TryFoldPrecedingMovIntoMovc hoisted x0 read across x0 write!\n";
+          return false;
+        }
+      }
+    }
+  }
+  return true;
+}
+
+bool CheckSelfSwizzleAndPostRaCleanup() {
+  // 1. 4-lane intra-register swap (r1.x<->r1.z, r1.y<->r1.w) emits 1 swizzle
+  //    MOV with zero scratch temp.
+  {
+    std::vector<FlowBlock> Blocks(3);
+    Blocks[0].Kind = FlowKind::Branch;
+    Blocks[0].Condition = {OperandKind::Input, 0};
+    Blocks[0].Edges = {
+        {2, {{1, Register(1, 2), 0}, {1, Register(1, 3), 1},
+             {1, Register(1, 0), 2}, {1, Register(1, 1), 3}}},
+        {1, {}}};
+    Blocks[1].Kind = FlowKind::Jump;
+    Blocks[1].Edges = {{2, {}}};
+    Blocks[2].Kind = FlowKind::Return;
+    Blocks[2].Instructions.push_back(
+        {D3D10_SB_OPCODE_MOV,
+         {{OperandKind::Output, 0, 0, 0xfu, 0xe4u},
+          {OperandKind::Temp, 1, 0, 0xfu, 0xe4u}}});
+    MirProgram Program;
+    Program.TempCount = 2;
+    std::string Err;
+    if (!LowerControlFlow(Blocks, Program, Err) || Program.TempCount != 2)
+      return false;
+    unsigned SwizzleMovs = 0;
+    for (const auto &I : Program.Instructions) {
+      if (I.Opcode == D3D10_SB_OPCODE_MOV && I.Operands[0].Kind == OperandKind::Temp &&
+          I.Operands[0].Index == 1 && I.Operands[0].Mask == 0xfu &&
+          I.Operands[1].Kind == OperandKind::Temp && I.Operands[1].Index == 1 &&
+          I.Operands[1].Swizzle == 0x4eu)
+        ++SwizzleMovs;
+    }
+    if (SwizzleMovs != 1)
+      return false;
+  }
+
+  // 2. Post-RA per-lane dead-write elimination + loop broadcast copy forwarding.
+  {
+    std::vector<FlowBlock> Blocks(1);
+    Blocks[0].Kind = FlowKind::Return;
+    auto &Insts = Blocks[0].Instructions;
+    // Dead zero-write immediately overwritten before any read:
+    Insts.push_back({D3D10_SB_OPCODE_MOV,
+                     {{OperandKind::Temp, 2, 0, 0x5u, 0},
+                      {OperandKind::Immediate, 0u}}});
+    Insts.push_back({D3D10_SB_OPCODE_MOV,
+                     {{OperandKind::Temp, 2, 0, 0x5u, 0},
+                      {OperandKind::Input, 0, 0, 0x5u, 0xe4u}}});
+    // Broadcast mov r0.xy, r1.yyyy followed by mul r2.zw, r2.zzzw, r0.xxxy:
+    Insts.push_back({D3D10_SB_OPCODE_MOV,
+                     {{OperandKind::Temp, 0, 0, 0x3u, 0},
+                      {OperandKind::Temp, 1, 0, 0x3u, 0x55u}}});
+    Insts.push_back({D3D10_SB_OPCODE_MUL,
+                     {{OperandKind::Temp, 2, 0, 0xcu, 0},
+                      {OperandKind::Temp, 2, 0, 0xcu, 0xfa},
+                      {OperandKind::Temp, 0, 0, 0xcu, 0x40}}});
+    Insts.push_back({D3D10_SB_OPCODE_MOV,
+                     {{OperandKind::Output, 0, 0, 0xfu, 0},
+                      {OperandKind::Temp, 2, 0, 0xfu, 0xe4u}}});
+    MirProgram Program;
+    Program.TempCount = 3;
+    std::string Err;
+    if (!LowerControlFlow(Blocks, Program, Err))
+      return false;
+    for (const auto &I : Program.Instructions) {
+      if (I.Opcode == D3D10_SB_OPCODE_MOV &&
+          I.Operands[0].Kind == OperandKind::Temp &&
+          (I.Operands[0].Index == 0 ||
+           I.Operands[1].Kind == OperandKind::Immediate))
+        return false;
+      if (I.Opcode == D3D10_SB_OPCODE_MUL &&
+          (I.Operands[2].Kind != OperandKind::Temp ||
+           I.Operands[2].Index != 1 || I.Operands[2].Swizzle != 0x55u))
+        return false;
+    }
+  }
+  return true;
+}
+
+bool CheckReleaseValidationRejectsMalformedIr() {
+  // 1. LowerControlFlow rejects malformed Branch terminator (only 1 edge).
+  {
+    std::vector<FlowBlock> Bad(2);
+    Bad[0].Kind = FlowKind::Branch;
+    Bad[0].Condition = {OperandKind::Temp, 0, 0, 1u, 0};
+    Bad[0].Edges = {{1, {}, 0}};
+    Bad[1].Kind = FlowKind::Return;
+    MirProgram Prog;
+    Prog.TempCount = 1;
+    std::string Err;
+    if (LowerControlFlow(Bad, Prog, Err) || Err.empty())
+      return false;
+  }
+  // 2. LowerControlFlow rejects duplicate Switch case value.
+  {
+    std::vector<FlowBlock> Bad(2);
+    Bad[0].Kind = FlowKind::Switch;
+    Bad[0].Condition = {OperandKind::Temp, 0, 0, 1u, 0};
+    Bad[0].Edges = {{1, {}, 0}, {1, {}, 7}, {1, {}, 7}};
+    Bad[1].Kind = FlowKind::Return;
+    MirProgram Prog;
+    Prog.TempCount = 1;
+    std::string Err;
+    if (LowerControlFlow(Bad, Prog, Err) || Err.empty())
+      return false;
+  }
+  // 3. WriteDxbc rejects unbalanced IF without ENDIF.
+  {
+    MirProgram Prog;
+    Prog.ShaderStage = Stage::Pixel;
+    Prog.TempCount = 1;
+    Prog.Instructions.push_back(
+        {D3D10_SB_OPCODE_IF, {{OperandKind::Temp, 0, 0, 1u, 0}}, true});
+    Prog.Instructions.push_back({D3D10_SB_OPCODE_RET, {}});
+    std::vector<uint8_t> Out;
+    std::string Err;
+    if (WriteDxbc(Prog, Out, Err) || Err.find("unterminated") == std::string::npos)
+      return false;
+  }
+  // 4. WriteDxbc rejects orphan ELSE.
+  {
+    MirProgram Prog;
+    Prog.ShaderStage = Stage::Pixel;
+    Prog.Instructions.push_back({D3D10_SB_OPCODE_ELSE, {}});
+    std::vector<uint8_t> Out;
+    std::string Err;
+    if (WriteDxbc(Prog, Out, Err) || Err.find("unbalanced") == std::string::npos)
+      return false;
+  }
+  // 5. WriteDxbc rejects out-of-bounds IndexableTemp index.
+  {
+    MirProgram Prog;
+    Prog.ShaderStage = Stage::Pixel;
+    Prog.TempCount = 1;
+    Prog.Instructions.push_back(
+        {D3D10_SB_OPCODE_MOV,
+         {{OperandKind::Temp, 0, 0, 1u, 0},
+          {OperandKind::IndexableTemp, 0, 0, 1u, 0}}});
+    std::vector<uint8_t> Out;
+    std::string Err;
+    if (WriteDxbc(Prog, Out, Err) ||
+        Err.find("indexable temp") == std::string::npos)
+      return false;
+  }
+  return true;
+}
+
 } // namespace
 
 int main() {
-  if (!CheckSwitchFallthroughGrouping() ||
-      !CheckHybridLocalDispatchLoopWithQuadLoop() ||
-      !CheckHoistRespectsDestRelativeIndex() ||
-      !CheckHoistRespectsDualDestRead() ||
-      !CheckEarlyExitAndLatchContinueLoop() ||
-      !CheckIfDiscardFold() ||
-      !CheckEarlyRetSharedTail() ||
-      !CheckDropRedundantTrailingMov() ||
-      !CheckNestedArmHoistAndElseDominatingDrop()) {
-    std::cerr << "Incorrect switch grouping or hybrid local dispatch loop\n";
-    return 1;
-  }
-  if (!CheckTailSinkAndMovcFlatten()) {
-    std::cerr << "Incorrect tail-sink / movc-flatten optimization\n";
-    return 1;
-  }
-  if (!CheckExpandedNestedLoop()) {
-    std::cerr << "Incorrect expanded nested-loop control flow\n";
-    return 1;
-  }
-  if (!CheckGuardedSharedTail(false, false) || !CheckGuardedSharedTail(false, true) ||
-      !CheckGuardedSharedTail(true, false) || !CheckGuardedSharedTail(true, true) ||
-      !CheckGuardedSharedTail(false, false, true)) {
-    std::cerr << "Incorrect guarded shared tail\n";
-    return 1;
-  }
-  if (!CheckSharedTailSwitch()) {
-    std::cerr << "Incorrect shared-tail switch selection\n";
-    return 1;
-  }
-  if (!CheckNestedFragments(true) || !CheckNestedFragments(false) ||
-      !CheckStructuredArms(true, false) || !CheckStructuredArms(false, true) ||
-      !CheckStructuredArms(true, true) || !CheckStructuredArms(true, false, true)) {
-    std::cerr << "Incorrect MIR structured branch arms\n";
-    return 1;
-  }
-  if (!CheckConditionalDiscard(true, true) || !CheckConditionalDiscard(false, true) ||
-      !CheckConditionalDiscard(true, false) ||
-      !CheckConditionalDiscard(true, true, true) || !CheckBranch() ||
-      !CheckCriticalEdgeCopies() || !CheckSwitchAndBackEdge() ||
-      !CheckQuadJoin() || !CheckQuadAfterLoop() || !CheckNativeQuadLoop() ||
-      !CheckNativeLinearExits() || !CheckBranchedLoop() ||
-      !CheckGatherInBranchedLoop() ||
-      !CheckQuadNeedsStructuredControlFlow() ||
-      !CheckTransactionalFailure() || !CheckSharedTail(false) || !CheckSharedTail(true)) {
-    std::cerr << "Incorrect MIR control-flow lowering\n";
-    return 1;
-  }
+#define RUN_CF_CHECK(EXPR)                                                     \
+  do {                                                                         \
+    if (!(EXPR)) {                                                             \
+      std::cerr << "ControlFlowTest failed: " #EXPR "\n";                      \
+      return 1;                                                                \
+    }                                                                          \
+  } while (false)
+  RUN_CF_CHECK(CheckSelfSwizzleAndPostRaCleanup());
+  RUN_CF_CHECK(CheckSwitchFallthroughGrouping());
+  RUN_CF_CHECK(CheckHybridLocalDispatchLoopWithQuadLoop());
+  RUN_CF_CHECK(CheckHoistRespectsDestRelativeIndex());
+  RUN_CF_CHECK(CheckHoistRespectsDualDestRead());
+  RUN_CF_CHECK(CheckEarlyExitAndLatchContinueLoop());
+  RUN_CF_CHECK(CheckIfDiscardFold());
+  RUN_CF_CHECK(CheckEarlyRetSharedTail());
+  RUN_CF_CHECK(CheckDropRedundantTrailingMov());
+  RUN_CF_CHECK(CheckNestedArmHoistAndElseDominatingDrop());
+  RUN_CF_CHECK(CheckTailSinkAndMovcFlatten());
+  RUN_CF_CHECK(CheckMovFoldDoesNotCrossIndexableWrite());
+  RUN_CF_CHECK(CheckExpandedNestedLoop());
+  RUN_CF_CHECK(CheckGuardedSharedTail(false, false));
+  RUN_CF_CHECK(CheckGuardedSharedTail(false, true));
+  RUN_CF_CHECK(CheckGuardedSharedTail(true, false));
+  RUN_CF_CHECK(CheckGuardedSharedTail(true, true));
+  RUN_CF_CHECK(CheckGuardedSharedTail(false, false, true));
+  RUN_CF_CHECK(CheckSharedTailSwitch());
+  RUN_CF_CHECK(CheckNestedFragments(true));
+  RUN_CF_CHECK(CheckNestedFragments(false));
+  RUN_CF_CHECK(CheckStructuredArms(true, false));
+  RUN_CF_CHECK(CheckStructuredArms(false, true));
+  RUN_CF_CHECK(CheckStructuredArms(true, true));
+  RUN_CF_CHECK(CheckStructuredArms(true, false, true));
+  RUN_CF_CHECK(CheckConditionalDiscard(true, true));
+  RUN_CF_CHECK(CheckConditionalDiscard(false, true));
+  RUN_CF_CHECK(CheckConditionalDiscard(true, false));
+  RUN_CF_CHECK(CheckConditionalDiscard(true, true, true));
+  RUN_CF_CHECK(CheckBranch());
+  RUN_CF_CHECK(CheckCriticalEdgeCopies());
+  RUN_CF_CHECK(CheckSwitchAndBackEdge());
+  RUN_CF_CHECK(CheckQuadJoin());
+  RUN_CF_CHECK(CheckQuadAfterLoop());
+  RUN_CF_CHECK(CheckNativeQuadLoop());
+  RUN_CF_CHECK(CheckNativeLinearExits());
+  RUN_CF_CHECK(CheckBranchedLoop());
+  RUN_CF_CHECK(CheckGatherInBranchedLoop());
+  RUN_CF_CHECK(CheckQuadNeedsStructuredControlFlow());
+  RUN_CF_CHECK(CheckTransactionalFailure());
+  RUN_CF_CHECK(CheckSharedTail(false));
+  RUN_CF_CHECK(CheckSharedTail(true));
+  RUN_CF_CHECK(CheckReleaseValidationRejectsMalformedIr());
+#undef RUN_CF_CHECK
+  return 0;
 }
