@@ -80,6 +80,7 @@
 #include "dxcb5/Compiler.h"
 #include "dxcb5/DxbcWriter.h"
 #include "dxcb5/LoopRegionValues.h"
+#include "dxcb5/SpecEngine.h"
 #include "clang/Frontend/Utils.h"
 #include "clang/Lex/PPCallbacks.h"
 #include "llvm/IR/Instructions.h"
@@ -660,6 +661,19 @@ static HRESULT CompileDxcb5(CompilerInstance &compiler, LLVMContext &context,
 
   const bool nanSafe =
       opts.Dxcb5NanSafe || opts.DisableOptimizations || opts.IEEEStrict;
+  if (opts.Dxcb5EmitUberDxil) {
+    auto module = BuildDxcb5Module(compiler, context, sourceName, diagnostics);
+    if (!module)
+      return E_FAIL;
+    module->GetDxilModule().ReEmitDxilResources();
+    std::string bitcode;
+    if (!dxcb5::spec::SerializeModuleBitcode(*module, bitcode)) {
+      diagnostics << "error: failed to serialize DXCB5 Uber DXIL bitcode\n";
+      return E_FAIL;
+    }
+    output.write(bitcode.data(), bitcode.size());
+    return S_OK;
+  }
   dxcb5::CompileSession::Frontend frontend;
   if (!session || !BuildDxcb5FrontendKey(compiler, sourceName, opts, frontend.Key)) {
     auto module = BuildDxcb5Module(compiler, context, sourceName, diagnostics);

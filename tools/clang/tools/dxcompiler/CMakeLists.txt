@@ -47,6 +47,10 @@ set(LLVM_LINK_COMPONENTS
   )
 
 if (WIN32)
+set(DXCOMPILER_DEF_FILE DXCompiler.def)
+if (TARGET DXCB5Backend)
+  set(DXCOMPILER_DEF_FILE DXCompiler.dxcb5.def)
+endif()
 set(SOURCES
   dxcapi.cpp
   dxcassembler.cpp
@@ -55,7 +59,7 @@ set(SOURCES
   dxcvalidator.cpp
   DXCompiler.cpp
   DXCompiler.rc
-  DXCompiler.def
+  ${DXCOMPILER_DEF_FILE}
   dxcfilesystem.cpp
   dxcutil.cpp
   dxcdisassembler.cpp
@@ -82,6 +86,12 @@ set (HLSL_IGNORE_SOURCES
   dxcdia.cpp
 )
 endif(WIN32)
+if (TARGET DXCB5Backend)
+  list(APPEND SOURCES
+    dxcb5specapi.cpp
+    ${LLVM_MAIN_SRC_DIR}/projects/dxcb5/unity-hook/UnityHlslAdapter.cpp
+  )
+endif()
 
 set(LIBRARIES
   clangIndex
@@ -133,6 +143,8 @@ endif()
 target_link_libraries(dxcompiler PRIVATE ${LIBRARIES})
 if(TARGET DXCB5Backend)
   target_compile_definitions(dxcompiler PRIVATE ENABLE_DXCB5)
+  target_include_directories(dxcompiler PRIVATE
+    "${LLVM_MAIN_SRC_DIR}/projects/dxcb5/unity-hook")
   target_link_libraries(dxcompiler PRIVATE DXCB5Backend)
 endif()
 if (ENABLE_SPIRV_CODEGEN)

@@ -1,0 +1,13 @@
+LIBRARY dxcompiler
+
+EXPORTS
+    DxcCreateInstance
+    DxcCreateInstance2
+    dxcb5_compile_uber_dxil
+    dxcb5_inspect_dxil
+    dxcb5_specialize_pair
+    dxcb5_specialize_stage
+    dxcb5_free_blob
+    dxcb5_get_abi_version
+    dxcb5_set_disabled_passes
+    dxcb5_configure_oracle
