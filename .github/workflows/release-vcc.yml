@@ -108,8 +108,34 @@ jobs:
               ver = f"{major}.{minor}.{next_patch}"
           write_out(True, ver, f"v{ver}")
 
-  build-and-release:
+  lean-proofs:
     needs: check
+    if: needs.check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install elan & Lean 4
+        run: |
+          curl -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+      - name: Verify Lean 4 Proofs & Codegen Sync
+        working-directory: projects/dxcb5/lean
+        run: |
+          set -euo pipefail
+          for f in ParallelCopy.lean OpcodeSpec.lean LaneDomain.lean RewriteRules.lean RegAllocValidator.lean Placement.lean; do
+            if grep -nEv '^[[:space:]]*--' "$f" | grep -Eq '(^|[^A-Za-z0-9_])(axiom|native_decide|sorry)([^A-Za-z0-9_]|$)'; then
+              echo "ERROR: Forbidden escape hatch in $f" >&2
+              exit 1
+            fi
+          done
+          lake build
+          lake exe dxcb5-codegen --opcodes /tmp/GeneratedOpcodeDesc.inc
+          diff -u --strip-trailing-cr /tmp/GeneratedOpcodeDesc.inc ../include/dxcb5/GeneratedOpcodeDesc.inc
+          lake exe dxcb5-codegen --rules /tmp/GeneratedRules.inc
+          diff -u --strip-trailing-cr /tmp/GeneratedRules.inc ../lib/Mir/Combine/GeneratedRules.inc
+
+  build-and-release:
+    needs: [check, lean-proofs]
     if: needs.check.outputs.should_build == 'true'
     runs-on: windows-latest
     steps:
@@ -145,15 +171,21 @@ jobs:
             -DCLANG_ENABLE_ARCMT=OFF `
             -DCLANG_ENABLE_STATIC_ANALYZER=OFF
 
-      - name: Build DXCB5 and Unity Proxy
+      - name: Build DXCB5, Unity Hook, and Test Suite
         shell: pwsh
         run: |
-          cmake --build build --target dxcompiler DXCB5UnityProxy dxcb5 DXCB5UnityProxyTest -j
+          cmake --build build --target `
+            dxcompiler dxc dxcb5 `
+            DXCB5UnityHook DXCB5CgBatchPlugin DXCB5UnityHookTest `
+            DXCB5SpecApiTest DXCB5CompileSessionTest `
+            DXCB5ControlFlowTest DXCB5MirTextTest DXCB5RegisterAllocationTest `
+            DXCB5SsaMirOptTest DXCB5ParallelCopyTest DXCB5LoopRegionValuesTest `
+            DXCB5PhiIncomingLayoutTest DXCB5DirectDxilTest DXCB5WarpABITest -j
 
-      - name: Run Proxy Smoke Test
+      - name: Run Full DXCB5 Test Suite
         shell: pwsh
         run: |
-          ctest --test-dir build/projects/dxcb5 -R "DXCB5UnityProxy" --output-on-failure
+          ctest --test-dir build/projects/dxcb5 --output-on-failure
 
       - name: Package VCC Zip
         shell: pwsh
