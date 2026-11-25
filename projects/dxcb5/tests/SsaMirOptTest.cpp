@@ -3334,11 +3334,9 @@ bool TestOpcodeSpecEffectContracts() {
   const Operand Tex0{OperandKind::Resource, 0, 0, 0xfu, kIdentitySwizzle};
   const Operand Smp0{OperandKind::Sampler, 0, 0, 0, 0};
 
-  auto BuildDiamond = [&](uint32_t SampleOp, bool UniformBranch,
-                          bool UseResult) {
-    MirProgram Mir;
+  auto BuildDiamond = [&](MirProgram &Mir, SsaProgram &Ssa, uint32_t SampleOp,
+                          bool UniformBranch, bool UseResult) {
     Mir.ShaderStage = Stage::Pixel;
-    SsaProgram Ssa(Mir);
     Ssa.Blocks.resize(4);
     const uint32_t TexVal = Ssa.AllocValue();
     const uint32_t PhiVal = Ssa.AllocValue();
@@ -3371,13 +3369,13 @@ bool TestOpcodeSpecEffectContracts() {
     Ssa.Blocks[3].Insts.push_back(
         {D3D10_SB_OPCODE_MOV, Operand{OperandKind::Output, 0, 0, 1u, 0}, NullOp,
          {MakeSsaTemp(PhiVal)}});
-    return std::make_pair(std::move(Mir), std::move(Ssa));
   };
 
   // (a) Divergent branch: ordinary SAMPLE MUST stay in B0.
   {
-    auto Pair = BuildDiamond(D3D10_SB_OPCODE_SAMPLE, false, true);
-    auto &Ssa = Pair.second;
+    MirProgram Mir;
+    SsaProgram Ssa(Mir);
+    BuildDiamond(Mir, Ssa, D3D10_SB_OPCODE_SAMPLE, false, true);
     SsaDomTree Dom;
     Ssa.ComputeDominators(Dom);
     RunOptColdSink(Ssa, Dom);
@@ -3392,8 +3390,9 @@ bool TestOpcodeSpecEffectContracts() {
 
   // (b) Uniform branch: ordinary SAMPLE CAN sink into B1.
   {
-    auto Pair = BuildDiamond(D3D10_SB_OPCODE_SAMPLE, true, true);
-    auto &Ssa = Pair.second;
+    MirProgram Mir;
+    SsaProgram Ssa(Mir);
+    BuildDiamond(Mir, Ssa, D3D10_SB_OPCODE_SAMPLE, true, true);
     SsaDomTree Dom;
     Ssa.ComputeDominators(Dom);
     RunOptColdSink(Ssa, Dom);
@@ -3408,8 +3407,9 @@ bool TestOpcodeSpecEffectContracts() {
 
   // (c) Dead ordinary SAMPLE: MaskedDce MUST eliminate it.
   {
-    auto Pair = BuildDiamond(D3D10_SB_OPCODE_SAMPLE, false, false);
-    auto &Ssa = Pair.second;
+    MirProgram Mir;
+    SsaProgram Ssa(Mir);
+    BuildDiamond(Mir, Ssa, D3D10_SB_OPCODE_SAMPLE, false, false);
     RunOptMaskedDce(Ssa);
     Ssa.CompactDead();
     std::string Err;
@@ -3421,8 +3421,9 @@ bool TestOpcodeSpecEffectContracts() {
 
   // (d) Divergent branch: explicit-LOD SAMPLE_L CAN sink into B1.
   {
-    auto Pair = BuildDiamond(D3D10_SB_OPCODE_SAMPLE_L, false, true);
-    auto &Ssa = Pair.second;
+    MirProgram Mir;
+    SsaProgram Ssa(Mir);
+    BuildDiamond(Mir, Ssa, D3D10_SB_OPCODE_SAMPLE_L, false, true);
     SsaDomTree Dom;
     Ssa.ComputeDominators(Dom);
     RunOptColdSink(Ssa, Dom);

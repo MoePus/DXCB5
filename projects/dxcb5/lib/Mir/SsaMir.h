@@ -201,6 +201,10 @@ struct SsaDomTree {
 class SsaProgram {
 public:
   explicit SsaProgram(MirProgram &Mir) : Mir(Mir) {}
+  SsaProgram(const SsaProgram &) = delete;
+  SsaProgram &operator=(const SsaProgram &) = delete;
+  SsaProgram(SsaProgram &&) = delete;
+  SsaProgram &operator=(SsaProgram &&) = delete;
 
   MirProgram &Mir;
   std::vector<SsaBlock> Blocks;
